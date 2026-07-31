@@ -341,6 +341,20 @@ fn put_and_get_usage_roundtrips() {
 }
 
 #[test]
+fn get_usage_on_an_empty_window_returns_zeroes_not_a_panic() {
+    // Regression test: `SUM(x)` with no GROUP BY always returns exactly one row even when zero
+    // rows match the WHERE clause — it hands back SQL NULL, not an empty result set. Converting
+    // that NULL directly into a `u64` panics (see the `COALESCE` fix in `get_usage`). This exact
+    // bug crashed a freshly-restarted busbar process during governance boot's budget hydration
+    // against a brand-new store (confirmed in CI: "budget hydration failed ... plugin panicked").
+    let Some(s) = fresh_store() else { return };
+    let back = s.get_usage("vk_never_used", 999).unwrap();
+    assert_eq!(back.requests, 0);
+    assert_eq!(back.billable_requests, 0);
+    assert!(back.models.is_empty());
+}
+
+#[test]
 fn add_usage_accumulates_and_floors_at_zero() {
     let Some(s) = fresh_store() else { return };
     let delta = UsageDelta {

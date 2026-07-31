@@ -637,10 +637,20 @@ impl Store for MysqlStore {
                 params! { "b" => bucket_id, "w" => window_start },
             )
             .map_err(store_err)?;
+        // `SUM()` with no GROUP BY always returns exactly one row, even when zero rows match the
+        // WHERE clause — it returns SQL NULL for each aggregate, not an empty result set. So
+        // `exec_first::<(u64, u64)>` is NEVER `None` here (that would require zero rows, which
+        // never happens); instead it was a `Some(Row)` whose columns are NULL for a bucket/window
+        // with no usage yet, and mysql_common's `FromRow` for a non-Option tuple PANICS trying to
+        // convert NULL into `u64` (confirmed: this crashed the freshly-restarted process during
+        // governance boot's budget hydration on a brand-new store, well before it enforced
+        // `STRICT_ALL_TABLES` any differently — this is a Rust-side conversion bug, not a sql_mode
+        // issue). `COALESCE(..., 0)` makes MySQL itself hand back 0 for the empty-aggregate case,
+        // matching Postgres/SQLite's "no row yet" -> 0 semantics.
         let totals: Option<(u64, u64)> = conn
             .exec_first(
-                "SELECT SUM(requests), SUM(billable_requests) FROM usage_windows \
-                 WHERE bucket_id = :b AND window_start = :w",
+                "SELECT COALESCE(SUM(requests), 0), COALESCE(SUM(billable_requests), 0) \
+                 FROM usage_windows WHERE bucket_id = :b AND window_start = :w",
                 params! { "b" => bucket_id, "w" => window_start },
             )
             .map_err(store_err)?;
