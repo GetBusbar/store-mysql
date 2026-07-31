@@ -530,7 +530,14 @@ impl Store for MysqlStore {
             .start_transaction(TxOpts::default())
             .map_err(store_err)?;
 
-        // Explicit existence/state check FIRST — rows_affected() alone can't distinguish
+        // bump_revision FIRST, matching the crate's fixed lock order (store_sequence before
+        // api_keys) — the existence/state check below still runs before any write, it just
+        // acquires its FOR UPDATE lock second. A no-op path (unknown id / already tombstoned)
+        // rolls the transaction back, so the revision it consumed is never observably committed;
+        // per the locked design, gaps in the sequence are harmless, only inversions are fatal.
+        let rev = Self::bump_revision(&mut tx)?;
+
+        // Explicit existence/state check — rows_affected() alone can't distinguish
         // "not found" from "already tombstoned, no-op" (both report 0 rows changed).
         let existing: Option<(Option<u64>,)> = tx
             .exec_first(
@@ -547,7 +554,6 @@ impl Store for MysqlStore {
             return Ok(()); // already tombstoned: idempotent no-op per the trait doc
         }
 
-        let rev = Self::bump_revision(&mut tx)?;
         let now = crate_now();
 
         tx.exec_drop(
@@ -572,6 +578,9 @@ impl Store for MysqlStore {
             .start_transaction(TxOpts::default())
             .map_err(store_err)?;
 
+        // bump_revision FIRST — see delete_key's comment on the fixed lock order.
+        let rev = Self::bump_revision(&mut tx)?;
+
         let existing: Option<(Option<u64>,)> = tx
             .exec_first(
                 "SELECT deleted_at FROM api_keys WHERE id = :id FOR UPDATE",
@@ -590,7 +599,6 @@ impl Store for MysqlStore {
                 )))
             }
             Some((Some(_),)) => {
-                let rev = Self::bump_revision(&mut tx)?;
                 let now = crate_now();
                 tx.exec_drop(
                     "UPDATE api_keys SET name = '', labels = '{}', updated_at = :now, revision = :rev \

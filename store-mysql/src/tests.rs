@@ -458,3 +458,42 @@ fn boot_probe_rejects_a_permissive_sql_mode() {
     conn.query_drop(format!("SET SESSION sql_mode = '{original}'"))
         .unwrap();
 }
+
+// ── Lock ordering ─────────────────────────────────────────────────────────────────────────────────
+
+/// `delete_key`/`scrub_key` must lock `store_sequence` (via `bump_revision`) BEFORE locking the
+/// `api_keys` row, matching every other control-plane transaction (`put_key`, `put_credential`,
+/// `revoke_credential`) — that fixed order is what the module doc claims makes deadlock across the
+/// admin plane structurally impossible. Proves it by racing a tight loop of `put_key` against a tight
+/// loop of `delete_key`+re-`put_key` (to keep the key alive for the next iteration) on the SAME row
+/// from concurrent threads: if the two lock acquisitions ever ran in opposite order, MySQL's deadlock
+/// detector would abort one side with a real "Deadlock found" error under this contention.
+#[test]
+fn delete_and_put_on_the_same_key_never_deadlock_under_concurrency() {
+    let Some(s) = fresh_store() else { return };
+    let id = "vk_lock_order_race";
+    s.put_key(&sample_key(id, "g0")).unwrap();
+
+    let put_store = MysqlStore::connect(&test_url().unwrap()).unwrap();
+    let del_store = MysqlStore::connect(&test_url().unwrap()).unwrap();
+
+    let putter = std::thread::spawn(move || {
+        for i in 0..150 {
+            put_store
+                .put_key(&sample_key(id, &format!("g{i}")))
+                .unwrap();
+        }
+    });
+    let deleter = std::thread::spawn(move || {
+        for _ in 0..150 {
+            // delete then immediately resurrect so the putter always has a live row to race against.
+            del_store.delete_key(id).unwrap();
+            del_store.put_key(&sample_key(id, "g_resurrect")).unwrap();
+        }
+    });
+
+    putter.join().expect("put_key thread must not panic/error");
+    deleter
+        .join()
+        .expect("delete_key thread must not panic/error");
+}
