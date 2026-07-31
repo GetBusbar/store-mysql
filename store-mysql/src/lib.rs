@@ -39,8 +39,7 @@ use mysql::{params, Opts, Pool, PooledConn, TxOpts};
 
 use busbar_api::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    ScopeRef, SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger,
-    VirtualKey,
+    SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
 };
 
 type MeteringRowTuple = (
@@ -343,15 +342,8 @@ impl MysqlStore {
             .take("revision")
             .ok_or_else(|| store_err("missing column: revision"))?;
 
-        // `allowed_pools` is stored as a JSON array of bare pool-name strings (matching the
-        // wire/storage shape used pre-generalization and by `busbar_api`'s own `allowed_scopes_wire`
-        // serde shim) — every entry is `kind: "pool"` by construction, since "pool" is the only
-        // registered scope kind today.
-        let allowed_scopes: Option<Vec<ScopeRef>> = match allowed_pools_json {
-            Some(s) => {
-                let pools: Vec<String> = serde_json::from_str(&s).map_err(store_err)?;
-                Some(pools.into_iter().map(ScopeRef::pool).collect())
-            }
+        let allowed_pools = match allowed_pools_json {
+            Some(s) => serde_json::from_str(&s).map_err(store_err)?,
             None => None,
         };
         let labels = serde_json::from_str(&labels_json).map_err(store_err)?;
@@ -360,7 +352,7 @@ impl MysqlStore {
             id,
             generation_hash,
             name,
-            allowed_scopes,
+            allowed_pools,
             enabled,
             created_at,
             group: if key_group.is_empty() {
@@ -445,20 +437,6 @@ fn secret_form_str(f: &SecretForm) -> &'static str {
     }
 }
 
-/// Serializes `allowed_scopes` down to the `allowed_pools` column's JSON-array-of-bare-strings
-/// shape (every entry is `kind: "pool"` by construction today — see `row_to_key`'s matching
-/// deserialization for the full rationale).
-fn scopes_to_pools_json(scopes: &Option<Vec<ScopeRef>>) -> StoreResult<Option<String>> {
-    scopes
-        .as_ref()
-        .map(|list| {
-            let bare: Vec<&str> = list.iter().map(|s| s.value.as_str()).collect();
-            serde_json::to_string(&bare)
-        })
-        .transpose()
-        .map_err(store_err)
-}
-
 impl Store for MysqlStore {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
         let mut conn = self.conn()?;
@@ -467,7 +445,12 @@ impl Store for MysqlStore {
             .map_err(store_err)?;
         let rev = Self::bump_revision(&mut tx)?;
 
-        let pools_json = scopes_to_pools_json(&key.allowed_scopes)?;
+        let pools_json = key
+            .allowed_pools
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(store_err)?;
         let labels_json = serde_json::to_string(&key.labels).map_err(store_err)?;
         let group = key.group.clone().unwrap_or_default();
 
@@ -892,7 +875,12 @@ impl Store for MysqlStore {
             .map_err(store_err)?;
         let rev = Self::bump_revision(&mut tx)?;
 
-        let pools_json = scopes_to_pools_json(&key.allowed_scopes)?;
+        let pools_json = key
+            .allowed_pools
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(store_err)?;
         let labels_json = serde_json::to_string(&key.labels).map_err(store_err)?;
         let group = key.group.clone().unwrap_or_default();
 

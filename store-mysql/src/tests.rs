@@ -59,7 +59,7 @@ fn sample_key(id: &str, generation: &str) -> VirtualKey {
         id: id.to_string(),
         generation_hash: generation.to_string(),
         name: "test".to_string(),
-        allowed_scopes: None,
+        allowed_pools: None,
         enabled: true,
         created_at: 1000,
         group: None,
@@ -105,14 +105,14 @@ fn put_get_roundtrips_a_key() {
 fn allowed_pools_none_vs_empty_round_trip_distinctly() {
     let Some(s) = fresh_store() else { return };
     let mut all_pools = sample_key("vk_all", "g");
-    all_pools.allowed_scopes = None;
+    all_pools.allowed_pools = None;
     let mut no_pools = sample_key("vk_none", "g");
-    no_pools.allowed_scopes = Some(vec![]);
+    no_pools.allowed_pools = Some(vec![]);
     s.put_key(&all_pools).unwrap();
     s.put_key(&no_pools).unwrap();
-    assert_eq!(s.get_key("vk_all").unwrap().unwrap().allowed_scopes, None);
+    assert_eq!(s.get_key("vk_all").unwrap().unwrap().allowed_pools, None);
     assert_eq!(
-        s.get_key("vk_none").unwrap().unwrap().allowed_scopes,
+        s.get_key("vk_none").unwrap().unwrap().allowed_pools,
         Some(vec![])
     );
 }
