@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "busbar-store-mysql"
+version = "1.0.0"
+publish = false            # internal workspace crate; never goes to crates.io
+edition = "2021"
+rust-version = "1.97"
+description = "The MySQL/MariaDB backend for busbar's durable governance store — the shared, multi-node db plugin. Implements busbar_api::Store over a mutex-guarded sync mysql client."
+license = "Apache-2.0"
+
+[dependencies]
+# INTERIM: busbarAI isn't public yet, so this is a local path dependency into a sibling checkout of
+# the monorepo. Once busbarAI ships publicly this should become a git (pinned rev/tag) or crates.io
+# dependency instead — same pattern already applied across every other first-party plugin.
+busbar-api = { path = "../../busbarAI/crates/api" }
+mysql = { version = "26", default-features = false, features = ["minimal"] }
+serde_json = "1"
+ulid = "1"
+
+[dev-dependencies]

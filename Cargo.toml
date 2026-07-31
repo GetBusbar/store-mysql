@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# This repo brings 100% of what it needs: the real MySQL/MariaDB store logic (store-mysql) and the
+# thin dlopen ABI adapter that packages it as a busbar plugin (store-mysql-plugin) both live here, as
+# a same-repo Cargo workspace — not split across this repo and busbarAI. Only busbar-api/
+# busbar-plugin-sdk (and, for the adapter's dev-dependencies, busbar-plugin-loader) still reach into a
+# sibling busbarAI checkout, since those are core-engine contracts every plugin depends on the same
+# way. Modeled directly on store-postgres's repo structure.
+[workspace]
+resolver = "2"
+members = [
+    "store-mysql",
+    "store-mysql-plugin",
+]

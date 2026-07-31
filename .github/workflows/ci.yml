@@ -1,0 +1,19 @@
+# Calls the canonical plugin-ci reusable workflow (GetBusbar/busbar/.github/workflows/plugin-ci.yml)
+# instead of hand-copying build/test/signoff steps here — see that file for what actually runs.
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  ci:
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@dev
+    with:
+      plugin_crate: busbar-store-mysql-plugin
+      plugin_kind: store
+      plugin_alias: mysql
+      service: mysql
+      busbar_ref: dev
