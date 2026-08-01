@@ -59,7 +59,7 @@ fn sample_key(id: &str, generation: &str) -> VirtualKey {
         id: id.to_string(),
         generation_hash: generation.to_string(),
         name: "test".to_string(),
-        allowed_pools: None,
+        allowed_scopes: None,
         enabled: true,
         created_at: 1000,
         group: None,
@@ -101,18 +101,43 @@ fn put_get_roundtrips_a_key() {
     assert!(back.revision > 0, "put_key must stamp a nonzero revision");
 }
 
+/// Regression for a real bug found in this session's final CI verification: every prior test in
+/// this file uses short synthetic ids (`"vk_1"`, `"vk_all"`, ...), all well under the schema's old
+/// `CHAR(26)` column width -- so the suite never caught that the REAL id format busbar's core mint
+/// path generates (`vk_` + 32 hex chars from `hex::encode([u8; 16])`, `governance/state.rs::mint_signed`)
+/// is 35 characters, wider than `CHAR(26)` (sized, incorrectly, for a 26-char ULID). A real mint
+/// against this schema failed with `MySqlError 1406: Data too long for column 'id'` -- reproduced
+/// directly against a live MySQL 8 container outside this crate's own suite before the fix. Widened
+/// `id`/`key_id`/`sub` to `VARCHAR(64)` for headroom against any future id-format change, not just
+/// today's 35 chars.
+#[test]
+fn put_get_roundtrips_a_key_with_the_real_35_char_mint_format() {
+    let Some(s) = fresh_store() else { return };
+    let id = format!("vk_{}", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4");
+    assert_eq!(
+        id.len(),
+        35,
+        "sanity: matches the real mint_signed id length"
+    );
+    let k = sample_key(&id, "binding:real-format:g1");
+    s.put_key(&k).unwrap();
+    let back = s.get_key(&id).unwrap().unwrap();
+    assert_eq!(back.id, id);
+    assert_eq!(back.generation_hash, "binding:real-format:g1");
+}
+
 #[test]
 fn allowed_pools_none_vs_empty_round_trip_distinctly() {
     let Some(s) = fresh_store() else { return };
     let mut all_pools = sample_key("vk_all", "g");
-    all_pools.allowed_pools = None;
+    all_pools.allowed_scopes = None;
     let mut no_pools = sample_key("vk_none", "g");
-    no_pools.allowed_pools = Some(vec![]);
+    no_pools.allowed_scopes = Some(vec![]);
     s.put_key(&all_pools).unwrap();
     s.put_key(&no_pools).unwrap();
-    assert_eq!(s.get_key("vk_all").unwrap().unwrap().allowed_pools, None);
+    assert_eq!(s.get_key("vk_all").unwrap().unwrap().allowed_scopes, None);
     assert_eq!(
-        s.get_key("vk_none").unwrap().unwrap().allowed_pools,
+        s.get_key("vk_none").unwrap().unwrap().allowed_scopes,
         Some(vec![])
     );
 }
@@ -338,6 +363,20 @@ fn put_and_get_usage_roundtrips() {
     assert_eq!(back.requests, 5);
     assert_eq!(back.billable_requests, 4);
     assert_eq!(back.models[0].tokens.input, 100);
+}
+
+#[test]
+fn get_usage_on_an_empty_window_returns_zeroes_not_a_panic() {
+    // Regression test: `SUM(x)` with no GROUP BY always returns exactly one row even when zero
+    // rows match the WHERE clause — it hands back SQL NULL, not an empty result set. Converting
+    // that NULL directly into a `u64` panics (see the `COALESCE` fix in `get_usage`). This exact
+    // bug crashed a freshly-restarted busbar process during governance boot's budget hydration
+    // against a brand-new store (confirmed in CI: "budget hydration failed ... plugin panicked").
+    let Some(s) = fresh_store() else { return };
+    let back = s.get_usage("vk_never_used", 999).unwrap();
+    assert_eq!(back.requests, 0);
+    assert_eq!(back.billable_requests, 0);
+    assert!(back.models.is_empty());
 }
 
 #[test]

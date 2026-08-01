@@ -39,7 +39,8 @@ use mysql::{params, Opts, Pool, PooledConn, TxOpts};
 
 use busbar_api::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    ScopeRef, SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger,
+    VirtualKey,
 };
 
 type MeteringRowTuple = (
@@ -73,7 +74,7 @@ const SCHEMA: &[&str] = &[
         CONSTRAINT ck_seq_singleton CHECK (id = 1)
     ) ENGINE=InnoDB",
     "CREATE TABLE IF NOT EXISTS api_keys (
-        id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+        id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
         name VARCHAR(256) NOT NULL DEFAULT '',
         key_group VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
         allowed_pools JSON NULL,
@@ -93,8 +94,8 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX idx_api_keys_revision ON api_keys (revision)",
     "CREATE INDEX idx_api_keys_group ON api_keys (key_group)",
     "CREATE TABLE IF NOT EXISTS credentials (
-        id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
-        key_id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+        key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
         kind VARCHAR(32) NOT NULL,
         slot TINYINT NOT NULL,
         public_id VARCHAR(256) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -117,7 +118,7 @@ const SCHEMA: &[&str] = &[
     ) ENGINE=InnoDB",
     "CREATE INDEX idx_cred_revision ON credentials (revision)",
     "CREATE TABLE IF NOT EXISTS denylist (
-        sub CHAR(26) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+        sub VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
         reason VARCHAR(512) NOT NULL DEFAULT '',
         revoked_at BIGINT UNSIGNED NOT NULL,
         expires_at BIGINT UNSIGNED NOT NULL,
@@ -142,7 +143,7 @@ const SCHEMA: &[&str] = &[
     ) ENGINE=InnoDB",
     "CREATE TABLE IF NOT EXISTS usage_metering (
         bucket CHAR(10) NOT NULL,
-        key_id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
         provider VARCHAR(128) NOT NULL,
         model VARCHAR(256) NOT NULL,
         key_group_at_use VARCHAR(128) NOT NULL DEFAULT '',
@@ -342,8 +343,15 @@ impl MysqlStore {
             .take("revision")
             .ok_or_else(|| store_err("missing column: revision"))?;
 
-        let allowed_pools = match allowed_pools_json {
-            Some(s) => serde_json::from_str(&s).map_err(store_err)?,
+        // `allowed_pools` is stored as a JSON array of bare pool-name strings (matching the
+        // wire/storage shape used pre-generalization and by `busbar_api`'s own `allowed_scopes_wire`
+        // serde shim) — every entry is `kind: "pool"` by construction, since "pool" is the only
+        // registered scope kind today.
+        let allowed_scopes: Option<Vec<ScopeRef>> = match allowed_pools_json {
+            Some(s) => {
+                let pools: Vec<String> = serde_json::from_str(&s).map_err(store_err)?;
+                Some(pools.into_iter().map(ScopeRef::pool).collect())
+            }
             None => None,
         };
         let labels = serde_json::from_str(&labels_json).map_err(store_err)?;
@@ -352,7 +360,7 @@ impl MysqlStore {
             id,
             generation_hash,
             name,
-            allowed_pools,
+            allowed_scopes,
             enabled,
             created_at,
             group: if key_group.is_empty() {
@@ -437,6 +445,20 @@ fn secret_form_str(f: &SecretForm) -> &'static str {
     }
 }
 
+/// Serializes `allowed_scopes` down to the `allowed_pools` column's JSON-array-of-bare-strings
+/// shape (every entry is `kind: "pool"` by construction today — see `row_to_key`'s matching
+/// deserialization for the full rationale).
+fn scopes_to_pools_json(scopes: &Option<Vec<ScopeRef>>) -> StoreResult<Option<String>> {
+    scopes
+        .as_ref()
+        .map(|list| {
+            let bare: Vec<&str> = list.iter().map(|s| s.value.as_str()).collect();
+            serde_json::to_string(&bare)
+        })
+        .transpose()
+        .map_err(store_err)
+}
+
 impl Store for MysqlStore {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
         let mut conn = self.conn()?;
@@ -445,12 +467,7 @@ impl Store for MysqlStore {
             .map_err(store_err)?;
         let rev = Self::bump_revision(&mut tx)?;
 
-        let pools_json = key
-            .allowed_pools
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(store_err)?;
+        let pools_json = scopes_to_pools_json(&key.allowed_scopes)?;
         let labels_json = serde_json::to_string(&key.labels).map_err(store_err)?;
         let group = key.group.clone().unwrap_or_default();
 
@@ -620,10 +637,20 @@ impl Store for MysqlStore {
                 params! { "b" => bucket_id, "w" => window_start },
             )
             .map_err(store_err)?;
+        // `SUM()` with no GROUP BY always returns exactly one row, even when zero rows match the
+        // WHERE clause — it returns SQL NULL for each aggregate, not an empty result set. So
+        // `exec_first::<(u64, u64)>` is NEVER `None` here (that would require zero rows, which
+        // never happens); instead it was a `Some(Row)` whose columns are NULL for a bucket/window
+        // with no usage yet, and mysql_common's `FromRow` for a non-Option tuple PANICS trying to
+        // convert NULL into `u64` (confirmed: this crashed the freshly-restarted process during
+        // governance boot's budget hydration on a brand-new store, well before it enforced
+        // `STRICT_ALL_TABLES` any differently — this is a Rust-side conversion bug, not a sql_mode
+        // issue). `COALESCE(..., 0)` makes MySQL itself hand back 0 for the empty-aggregate case,
+        // matching Postgres/SQLite's "no row yet" -> 0 semantics.
         let totals: Option<(u64, u64)> = conn
             .exec_first(
-                "SELECT SUM(requests), SUM(billable_requests) FROM usage_windows \
-                 WHERE bucket_id = :b AND window_start = :w",
+                "SELECT COALESCE(SUM(requests), 0), COALESCE(SUM(billable_requests), 0) \
+                 FROM usage_windows WHERE bucket_id = :b AND window_start = :w",
                 params! { "b" => bucket_id, "w" => window_start },
             )
             .map_err(store_err)?;
@@ -875,12 +902,7 @@ impl Store for MysqlStore {
             .map_err(store_err)?;
         let rev = Self::bump_revision(&mut tx)?;
 
-        let pools_json = key
-            .allowed_pools
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(store_err)?;
+        let pools_json = scopes_to_pools_json(&key.allowed_scopes)?;
         let labels_json = serde_json::to_string(&key.labels).map_err(store_err)?;
         let group = key.group.clone().unwrap_or_default();
 
