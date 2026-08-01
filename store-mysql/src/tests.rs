@@ -114,7 +114,11 @@ fn put_get_roundtrips_a_key() {
 fn put_get_roundtrips_a_key_with_the_real_35_char_mint_format() {
     let Some(s) = fresh_store() else { return };
     let id = format!("vk_{}", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4");
-    assert_eq!(id.len(), 35, "sanity: matches the real mint_signed id length");
+    assert_eq!(
+        id.len(),
+        35,
+        "sanity: matches the real mint_signed id length"
+    );
     let k = sample_key(&id, "binding:real-format:g1");
     s.put_key(&k).unwrap();
     let back = s.get_key(&id).unwrap().unwrap();
