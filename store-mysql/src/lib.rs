@@ -74,7 +74,7 @@ const SCHEMA: &[&str] = &[
         CONSTRAINT ck_seq_singleton CHECK (id = 1)
     ) ENGINE=InnoDB",
     "CREATE TABLE IF NOT EXISTS api_keys (
-        id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+        id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
         name VARCHAR(256) NOT NULL DEFAULT '',
         key_group VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
         allowed_pools JSON NULL,
@@ -94,8 +94,8 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX idx_api_keys_revision ON api_keys (revision)",
     "CREATE INDEX idx_api_keys_group ON api_keys (key_group)",
     "CREATE TABLE IF NOT EXISTS credentials (
-        id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
-        key_id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+        key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
         kind VARCHAR(32) NOT NULL,
         slot TINYINT NOT NULL,
         public_id VARCHAR(256) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -118,7 +118,7 @@ const SCHEMA: &[&str] = &[
     ) ENGINE=InnoDB",
     "CREATE INDEX idx_cred_revision ON credentials (revision)",
     "CREATE TABLE IF NOT EXISTS denylist (
-        sub CHAR(26) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+        sub VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
         reason VARCHAR(512) NOT NULL DEFAULT '',
         revoked_at BIGINT UNSIGNED NOT NULL,
         expires_at BIGINT UNSIGNED NOT NULL,
@@ -143,7 +143,7 @@ const SCHEMA: &[&str] = &[
     ) ENGINE=InnoDB",
     "CREATE TABLE IF NOT EXISTS usage_metering (
         bucket CHAR(10) NOT NULL,
-        key_id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
         provider VARCHAR(128) NOT NULL,
         model VARCHAR(256) NOT NULL,
         key_group_at_use VARCHAR(128) NOT NULL DEFAULT '',

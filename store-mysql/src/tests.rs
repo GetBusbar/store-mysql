@@ -101,6 +101,27 @@ fn put_get_roundtrips_a_key() {
     assert!(back.revision > 0, "put_key must stamp a nonzero revision");
 }
 
+/// Regression for a real bug found in this session's final CI verification: every prior test in
+/// this file uses short synthetic ids (`"vk_1"`, `"vk_all"`, ...), all well under the schema's old
+/// `CHAR(26)` column width -- so the suite never caught that the REAL id format busbar's core mint
+/// path generates (`vk_` + 32 hex chars from `hex::encode([u8; 16])`, `governance/state.rs::mint_signed`)
+/// is 35 characters, wider than `CHAR(26)` (sized, incorrectly, for a 26-char ULID). A real mint
+/// against this schema failed with `MySqlError 1406: Data too long for column 'id'` -- reproduced
+/// directly against a live MySQL 8 container outside this crate's own suite before the fix. Widened
+/// `id`/`key_id`/`sub` to `VARCHAR(64)` for headroom against any future id-format change, not just
+/// today's 35 chars.
+#[test]
+fn put_get_roundtrips_a_key_with_the_real_35_char_mint_format() {
+    let Some(s) = fresh_store() else { return };
+    let id = format!("vk_{}", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4");
+    assert_eq!(id.len(), 35, "sanity: matches the real mint_signed id length");
+    let k = sample_key(&id, "binding:real-format:g1");
+    s.put_key(&k).unwrap();
+    let back = s.get_key(&id).unwrap().unwrap();
+    assert_eq!(back.id, id);
+    assert_eq!(back.generation_hash, "binding:real-format:g1");
+}
+
 #[test]
 fn allowed_pools_none_vs_empty_round_trip_distinctly() {
     let Some(s) = fresh_store() else { return };
