@@ -349,11 +349,21 @@ impl MysqlStore {
         Ok(())
     }
 
+    /// A rejected probe INSERT is proof of CHECK enforcement ONLY if it's the SPECIFIC
+    /// CHECK-violation error this schema's two target engines actually produce -- MySQL 8.0.16+'s
+    /// `ER_CHECK_CONSTRAINT_VIOLATED` (3819) or MariaDB's `ER_CONSTRAINT_FAILED` (4025). Any other
+    /// error (a lock timeout, a connection blip) is inconclusive and must never be silently read as
+    /// "enforced" -- that was the bug: the prior code treated ANY error as proof.
+    fn is_check_constraint_violation(e: &mysql::Error) -> bool {
+        matches!(e, mysql::Error::MySqlError(inner) if inner.code == 3819 || inner.code == 4025)
+    }
+
     /// Live functional probes for the two failure modes a schema-shape check cannot catch:
     /// (1) `CHECK` constraints parsed but not enforced (MySQL < 8.0.16, Aurora MySQL 2.x);
     /// (2) `STRICT_ALL_TABLES` not in `sql_mode` (a VARCHAR/BIGINT overflow silently truncates
-    ///     instead of erroring). Both are probed by attempting an operation that MUST fail, inside
-    ///     a transaction that's always rolled back, never committed — no probe row survives.
+    ///     instead of erroring). (1) is probed via a session-private `TEMPORARY` table (never the
+    ///     real shared schema — zero contention with real traffic or another node's simultaneous
+    ///     probe), dropped immediately after; no probe row ever touches real data.
     fn probe_invariants(conn: &mut PooledConn) -> StoreResult<()> {
         let sql_mode: String = conn
             .query_first("SELECT @@sql_mode")
@@ -367,15 +377,38 @@ impl MysqlStore {
             )));
         }
 
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
-        let rejected = tx
-            .query_drop(
-                "INSERT INTO store_sequence (id, revision) VALUES (999, 0)", // id=999 violates ck_seq_singleton (id=1)
-            )
-            .is_err();
-        let _ = tx.rollback();
+        // Session-private TEMPORARY table -- zero contention with real traffic or another node's
+        // simultaneous boot probe (unlike probing the real, shared `store_sequence` singleton row,
+        // which a concurrent live control-plane transaction, or another node probing at the same
+        // moment, could genuinely lock -- producing a lock-wait-timeout/deadlock error that has
+        // nothing to do with CHECK enforcement and would be misread as "unexpected failure"
+        // below). Auto-dropped at session end regardless; explicitly dropped here too.
+        conn.query_drop(
+            "CREATE TEMPORARY TABLE busbar_check_probe (\
+                id INT PRIMARY KEY, CONSTRAINT ck_probe CHECK (id = 1)\
+             ) ENGINE=InnoDB",
+        )
+        .map_err(store_err)?;
+        let probe_result = conn.query_drop("INSERT INTO busbar_check_probe (id) VALUES (999)");
+        let _ = conn.query_drop("DROP TEMPORARY TABLE busbar_check_probe");
+
+        // ER_CHECK_CONSTRAINT_VIOLATED (3819, MySQL 8.0.16+) / ER_CONSTRAINT_FAILED (4025,
+        // MariaDB) -- the two vendor-specific codes this schema's CHECK enforcement actually
+        // produces on the two engines this store targets (module doc: "MySQL 8.0.16+, MariaDB, and
+        // Aurora MySQL"). Any OTHER error is inconclusive and hard-fails rather than being silently
+        // read as "enforced" -- with the temp-table probe above having zero contention with real
+        // traffic, there's no remaining benign reason left for a different error here.
+        let rejected = match probe_result {
+            Ok(()) => false,
+            Err(ref e) if Self::is_check_constraint_violation(e) => true,
+            Err(e) => {
+                return Err(store_err(format!(
+                    "boot probe failed: could not determine whether CHECK constraints are enforced \
+                     — the probe INSERT failed for an unexpected reason instead of the expected \
+                     CHECK violation (MySQL code 3819 / MariaDB code 4025): {e}"
+                )));
+            }
+        };
         if !rejected {
             return Err(store_err(
                 "boot probe failed: a CHECK constraint violation was NOT rejected — this server \
