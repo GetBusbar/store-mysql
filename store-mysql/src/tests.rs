@@ -748,6 +748,75 @@ fn migrate_v2_does_not_touch_a_row_when_the_database_is_not_pre_v2() {
     );
 }
 
+fn scratch_collation(conn: &mut PooledConn, table: &str, column: &str) -> String {
+    conn.query_first(format!(
+        "SELECT COLLATION_NAME FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{table}' AND COLUMN_NAME = '{column}'"
+    ))
+    .unwrap()
+    .expect("column exists")
+}
+
+/// A `usage_metering`-shaped table created before v3 (v1.0.0 shipped `key_group_at_use` without
+/// `ascii_bin`, inheriting MySQL's case-insensitive default) must have its collation corrected to
+/// `ascii_bin` when the database predates v3 (`prior_version` 1..3).
+#[test]
+fn migrate_v3_fixes_key_group_at_use_collation_for_a_pre_migration_table() {
+    let Some(s) = fresh_store() else { return };
+    let table = unique_scratch_table("premigration_v3");
+
+    let mut conn = s.pool.get_conn().unwrap();
+    // The pre-v3 shape: no explicit collation, so it inherits the database default (utf8mb4_*, NOT
+    // ascii_bin) -- exactly what a real v1.0.0-created `usage_metering` table has today.
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (key_group_at_use VARCHAR(128) NOT NULL DEFAULT '') ENGINE=InnoDB"
+    ))
+    .unwrap();
+    let before = scratch_collation(&mut conn, &table, "key_group_at_use");
+    assert_ne!(
+        before, "ascii_bin",
+        "the scratch table must start in the pre-fix state, or this test proves nothing"
+    );
+
+    MysqlStore::run_v3_ascii_bin_fix_if_needed(&mut conn, 1, &table)
+        .expect("the v3 ascii_bin fix must succeed against a prior_version=1 database");
+
+    let after = scratch_collation(&mut conn, &table, "key_group_at_use");
+    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
+    assert_eq!(
+        after, "ascii_bin",
+        "a pre-v3 table's key_group_at_use collation must be corrected to ascii_bin"
+    );
+}
+
+/// A table already at-or-past v3 (already `ascii_bin`, or a fresh v3+ install) must not have the
+/// migration re-run pointlessly — gated on `prior_version >= 3` as well as `prior_version == 0`.
+#[test]
+fn migrate_v3_does_not_touch_a_table_when_the_database_is_not_pre_v3() {
+    let Some(s) = fresh_store() else { return };
+    let table = unique_scratch_table("norerun_v3");
+
+    let mut conn = s.pool.get_conn().unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (
+            key_group_at_use VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT ''
+        ) ENGINE=InnoDB"
+    ))
+    .unwrap();
+
+    MysqlStore::run_v3_ascii_bin_fix_if_needed(&mut conn, 3, &table)
+        .expect("a no-op call at prior_version=3 must still succeed");
+    MysqlStore::run_v3_ascii_bin_fix_if_needed(&mut conn, 0, &table)
+        .expect("a no-op call at prior_version=0 (fresh database) must still succeed");
+
+    let after = scratch_collation(&mut conn, &table, "key_group_at_use");
+    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
+    assert_eq!(
+        after, "ascii_bin",
+        "both no-op calls must leave the collation untouched"
+    );
+}
+
 /// KNOWN, DOCUMENTED, NOT-YET-CLOSED GAP -- see `run_v2_backfill_if_needed`'s own doc comment for
 /// the full writeup and why a `GET_LOCK`-based fix (designed, then rejected in adversarial design
 /// review) doesn't actually close this. Characterizes the exact rolling-upgrade race as a

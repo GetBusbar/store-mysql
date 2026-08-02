@@ -62,10 +62,18 @@ fn store_err<E: std::fmt::Display>(e: E) -> StoreError {
 }
 
 /// Numeric, not the original `&str`: `try_init_schema` needs to compare "the version this database
-/// was AT before this boot" against this constant to decide whether the v2 backfill below has
-/// already run, and `"1" < "2"` string-comparison stops being safe the moment version numbers reach
-/// two digits.
-const SCHEMA_VERSION: u32 = 2;
+/// was AT before this boot" against this constant to decide which one-time migration steps below
+/// have already run, and `"1" < "2"` string-comparison stops being safe the moment version numbers
+/// reach two digits.
+const SCHEMA_VERSION: u32 = 3;
+
+/// The version each one-time migration step targets crossing INTO — named so a gate reads as "did
+/// this database predate step N" rather than a bare magic number, and so a future step can't be
+/// accidentally gated on `< SCHEMA_VERSION` (wrong: that would re-fire EVERY prior step, not just
+/// the newest one, every time SCHEMA_VERSION bumps again — each step must stay pinned to the one
+/// version boundary it actually closes).
+const V2_BILLABLE_REQUESTS_BACKFILL: u32 = 2;
+const V3_KEY_GROUP_AT_USE_ASCII_BIN: u32 = 3;
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS store_meta (
@@ -150,7 +158,7 @@ const SCHEMA: &[&str] = &[
         key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
         provider VARCHAR(128) NOT NULL,
         model VARCHAR(256) NOT NULL,
-        key_group_at_use VARCHAR(128) NOT NULL DEFAULT '',
+        key_group_at_use VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
         pricing_version VARCHAR(64) NOT NULL DEFAULT '',
         requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
         billable_requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
@@ -299,7 +307,7 @@ impl MysqlStore {
         prior_version: u32,
         table: &str,
     ) -> StoreResult<()> {
-        if prior_version > 0 && prior_version < SCHEMA_VERSION {
+        if prior_version > 0 && prior_version < V2_BILLABLE_REQUESTS_BACKFILL {
             // Batched (LIMIT 5000 per statement, looped until exhausted), matching the same
             // bounded-batch convention purge_windows_before/purge_metering_before already use
             // elsewhere in this file -- an unbounded single UPDATE across the whole table risks
@@ -315,6 +323,32 @@ impl MysqlStore {
                     break;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// v3: `usage_metering.key_group_at_use` shipped in v1.0.0 without `ascii_bin` (inherited
+    /// MySQL's default case-INSENSITIVE collation) -- a real gap against this crate's own stated
+    /// invariant that every opaque identifier/group-name column gets byte-exact comparison. The
+    /// `CREATE TABLE IF NOT EXISTS` fix to the schema (above) only affects a FRESH database; any
+    /// database that already ran `try_init_schema` before this fix shipped has the table already
+    /// created with the wrong collation, so a real `ALTER TABLE` is required to close it on upgrade.
+    /// Idempotent: MODIFY COLUMN to the same collation it's already at is a harmless no-op on a
+    /// database created fresh (already ascii_bin) or one already migrated past v3.
+    ///
+    /// Same `table` parameter for test isolation as `run_v2_backfill_if_needed` -- see that
+    /// function's doc comment for why (no `CREATE DATABASE` privilege in CI).
+    fn run_v3_ascii_bin_fix_if_needed(
+        conn: &mut PooledConn,
+        prior_version: u32,
+        table: &str,
+    ) -> StoreResult<()> {
+        if prior_version > 0 && prior_version < V3_KEY_GROUP_AT_USE_ASCII_BIN {
+            conn.query_drop(format!(
+                "ALTER TABLE {table} MODIFY COLUMN key_group_at_use \
+                 VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT ''"
+            ))
+            .map_err(store_err)?;
         }
         Ok(())
     }
@@ -375,6 +409,7 @@ impl MysqlStore {
         }
 
         Self::run_v2_backfill_if_needed(&mut conn, prior_version, "usage_windows")?;
+        Self::run_v3_ascii_bin_fix_if_needed(&mut conn, prior_version, "usage_metering")?;
 
         conn.query_drop(
             "INSERT INTO store_meta (k, v) VALUES ('schema_version', :v) \
