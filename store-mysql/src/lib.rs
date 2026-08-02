@@ -61,7 +61,11 @@ fn store_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError(e.to_string())
 }
 
-const SCHEMA_VERSION: &str = "1";
+/// Numeric, not the original `&str`: `try_init_schema` needs to compare "the version this database
+/// was AT before this boot" against this constant to decide whether the v2 backfill below has
+/// already run, and `"1" < "2"` string-comparison stops being safe the moment version numbers reach
+/// two digits.
+const SCHEMA_VERSION: u32 = 2;
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS store_meta (
@@ -228,8 +232,68 @@ impl MysqlStore {
         unreachable!("loop always returns on the final attempt")
     }
 
+    /// v2 one-time backfill, closing the SAME `hydrate_budgets` billing bug store-postgres's own v6
+    /// backfill closes (busbarAI core's `crates/busbar/src/governance/state.rs`): pre-v2 rows may
+    /// have `billable_requests = 0` alongside a real, positive `requests` count purely because this
+    /// store didn't track the split before v2, never because of a genuine refund/discount. Trusting
+    /// `billable_requests` unconditionally (as `hydrate_budgets` now does) needs those historical
+    /// rows backfilled once, here, at the source — never re-derived from `requests` at read time by
+    /// a heuristic (that heuristic is exactly the bug being closed). Only fires when crossing INTO v2
+    /// from a database that genuinely predates it (`prior_version < 2` and `prior_version > 0`, i.e.
+    /// `store_meta` already existed with an old value) — a brand-new v1-absent database has no
+    /// pre-migration rows and must not run this pointless no-op.
+    ///
+    /// Takes `prior_version` as an explicit argument rather than reading `store_meta` itself, purely
+    /// so the migration tests can call this directly with a hardcoded version and never have to
+    /// mutate the single GLOBAL `store_meta.schema_version` row the whole shared test-server
+    /// suite reads/writes on every `connect()` — that mutation approach was tried first and produced
+    /// a real, reproduced race (any concurrently-running test's own `connect()` unconditionally
+    /// overwrites `schema_version` back to current, racing a test's deliberately-lowered marker).
+    ///
+    /// Also takes `table` rather than hardcoding `usage_windows`, again purely for test isolation:
+    /// unlike store-postgres's own equivalent test (which runs each migration test against its own
+    /// throwaway DATABASE), the CI `busbar` MySQL user has no `CREATE DATABASE` privilege (confirmed:
+    /// `ERROR 1044 Access denied for user 'busbar'@'%' to database ...` — the official mysql image's
+    /// `MYSQL_USER` mechanism only grants `ALL PRIVILEGES` on the one `MYSQL_DATABASE`, not globally)
+    /// — table-level isolation within that one shared database is the only DDL this user can do, and
+    /// it's real DDL the rest of this crate's suite already exercises freely. Production always calls
+    /// this with `"usage_windows"`; the real, unscoped whole-table UPDATE below is exactly correct in
+    /// that context (a one-time boot migration runs before any concurrent traffic exists) — the table
+    /// parameter exists ONLY so a test can point it at a private scratch table instead of racing every
+    /// other concurrently-running test's legitimate writes to the real, shared `usage_windows`.
+    fn run_v2_backfill_if_needed(
+        conn: &mut PooledConn,
+        prior_version: u32,
+        table: &str,
+    ) -> StoreResult<()> {
+        if prior_version > 0 && prior_version < 2 {
+            conn.query_drop(format!(
+                "UPDATE {table} SET billable_requests = requests \
+                 WHERE billable_requests = 0 AND requests > 0"
+            ))
+            .map_err(store_err)?;
+        }
+        Ok(())
+    }
+
     fn try_init_schema(pool: &Pool) -> StoreResult<()> {
         let mut conn = pool.get_conn().map_err(store_err)?;
+
+        // Read the version this database was AT before this boot — BEFORE the `CREATE TABLE IF NOT
+        // EXISTS store_meta` below (harmless either way, since a fresh database has no `store_meta`
+        // row yet) and BEFORE any schema statement runs, so a version-gated backfill below can tell
+        // "this database predates v2" from "this database was created fresh already at v2" (a fresh
+        // install has no pre-migration rows to backfill, and must not have the (harmless but
+        // pointless) backfill UPDATE run against it either).
+        let prior_version: u32 = conn
+            .query_first::<Option<String>, _>(
+                "SELECT v FROM store_meta WHERE k = 'schema_version'",
+            )
+            .unwrap_or(None)
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
         for stmt in SCHEMA {
             // IF NOT EXISTS on tables; CREATE INDEX has no IF NOT EXISTS in MySQL/MariaDB, so a
             // "duplicate key name" error on re-run (schema already applied) is swallowed here —
@@ -243,6 +307,9 @@ impl MysqlStore {
                 }
             }
         }
+
+        Self::run_v2_backfill_if_needed(&mut conn, prior_version, "usage_windows")?;
+
         conn.query_drop(
             "INSERT INTO store_meta (k, v) VALUES ('schema_version', :v) \
              ON DUPLICATE KEY UPDATE v = :v"
