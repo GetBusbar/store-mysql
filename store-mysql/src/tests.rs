@@ -815,6 +815,101 @@ fn characterize_v2_backfill_loses_a_row_to_a_racing_live_write() {
     );
 }
 
+/// The two tests above prove `run_v2_backfill_if_needed` works correctly called DIRECTLY with a
+/// hand-supplied `prior_version`/`table` -- neither ever goes through `try_init_schema`'s REAL
+/// wiring: reading `prior_version` from the actual `store_meta.schema_version` row and calling the
+/// backfill with the real hardcoded table name `"usage_windows"`. A regression that reordered that
+/// real read (e.g. moved it after the SCHEMA loop / the `schema_version` write) or typo'd the real
+/// table name would ship undetected by either test above.
+///
+/// Exercises the REAL public `MysqlStore::connect()` entry point (which internally calls the real,
+/// unparameterized `try_init_schema`) against a DEDICATED, throwaway database -- not the shared
+/// `busbar_test` every other test in this suite uses -- so this can safely pre-seed a real pre-v2
+/// `store_meta.schema_version='1'` row without racing any other concurrently-running test's own
+/// `connect()` calls (the documented reason `run_v2_backfill_if_needed` takes an explicit
+/// `prior_version` instead of reading the shared row itself). Needs `root` to `CREATE DATABASE`
+/// (same constraint as the app-level `busbar` CI user lacking that privilege, documented on the
+/// migration tests above) -- real CI has `root`/`busbar` available with matching credentials (see
+/// `plugin-ci.yml`'s own "set strict sql_mode" step, which already connects as root).
+#[test]
+fn try_init_schema_real_wiring_backfills_a_genuinely_pre_v2_database() {
+    let Some(url) = test_url() else { return };
+    let db_name = format!(
+        "busbar_wiring_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    let root_url = url.replacen("busbar:busbar@", "root:busbar@", 1);
+    let root_opts = Opts::from_url(&root_url).unwrap();
+    let root_pool = Pool::new(root_opts).unwrap();
+    let mut root_conn = root_pool.get_conn().unwrap();
+    root_conn
+        .query_drop(format!("CREATE DATABASE {db_name}"))
+        .unwrap();
+    root_conn
+        .query_drop(format!(
+            "GRANT ALL PRIVILEGES ON {db_name}.* TO 'busbar'@'%'"
+        ))
+        .unwrap();
+
+    // Point the app-level busbar user at the fresh dedicated database (swap the path component of
+    // the URL, keep the same host/port/credentials). `url` is only a transitive dep (via `mysql`),
+    // so plain string surgery on the last path segment instead of a proper URL crate.
+    let dedicated_url = {
+        let cut = url
+            .rfind('/')
+            .expect("test_url() must be a mysql:// URL with a /database path");
+        format!("{}/{db_name}", &url[..cut])
+    };
+
+    // Boot ONCE to create the real schema for real via try_init_schema, then hand-seed a genuine
+    // pre-v2 marker directly in the real store_meta row (safe here -- this database has no other
+    // concurrent user) and a pre-v2-shaped row in the real usage_windows table.
+    let store1 = MysqlStore::connect(&dedicated_url).expect("first boot must create the schema");
+    {
+        let mut conn = store1.pool.get_conn().unwrap();
+        conn.query_drop("UPDATE store_meta SET v = '1' WHERE k = 'schema_version'")
+            .unwrap();
+        conn.query_drop(
+            "INSERT INTO usage_windows \
+             (window_start, bucket_scope, bucket_id, model, requests, billable_requests) \
+             VALUES (9000, 'key', 'vk_wiring', 'gpt', 5, 0)",
+        )
+        .unwrap();
+    }
+    drop(store1);
+
+    // Reconnect -- THIS is the real try_init_schema call under test: it must read prior_version=1
+    // from the real store_meta row (not a hand-supplied one) and run the backfill against the
+    // real, hardcoded "usage_windows" table name (not a scratch table a test pointed it at).
+    let store2 = MysqlStore::connect(&dedicated_url).expect("second boot (the real migration)");
+    let mut conn = store2.pool.get_conn().unwrap();
+    let (requests, billable): (u64, u64) = conn
+        .query_first(
+            "SELECT requests, billable_requests FROM usage_windows \
+             WHERE bucket_id = 'vk_wiring' AND window_start = 9000",
+        )
+        .unwrap()
+        .unwrap();
+    drop(store2);
+
+    root_conn
+        .query_drop(format!("DROP DATABASE {db_name}"))
+        .unwrap();
+
+    assert_eq!(requests, 5);
+    assert_eq!(
+        billable, 5,
+        "try_init_schema's REAL wiring (real store_meta read, real \"usage_windows\" table name) \
+         must have backfilled this pre-v2 row -- a regression to either would leave billable_requests \
+         at 0, undetected by the two tests above that bypass this wiring entirely"
+    );
+}
+
 // ── read_prior_version: real query errors must not collapse into "fresh install" ───────────────────
 
 fn scratch_meta_table(conn: &mut PooledConn, name: &str) -> String {
