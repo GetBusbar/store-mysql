@@ -276,23 +276,46 @@ impl MysqlStore {
         Ok(())
     }
 
+    /// Read the version this database was AT before this boot from `store_meta`, tolerating "no row
+    /// yet" (a genuinely fresh database, or one already at v2 that never needed a marker written
+    /// pre-v2) as version 0, but propagating any OTHER query failure (a connection blip, a lock
+    /// timeout) instead of silently treating it identically to "fresh install" -- collapsing those
+    /// two outcomes previously meant a transient failure here permanently marked a possibly-
+    /// unmigrated database as migrated (schema_version still got written unconditionally right
+    /// after). A stored value that fails to parse as a version number is ALSO now a hard error
+    /// rather than a silent 0 -- a corrupt marker is exactly the kind of "looks fine, isn't" state
+    /// this store's own boot-probe philosophy (module doc, above) says must hard-fail, not warn.
+    /// Takes `table` rather than hardcoding `store_meta`, purely for test isolation -- same reason
+    /// `run_v2_backfill_if_needed` takes its own `table` param (see that function's doc comment):
+    /// `store_meta` is a single shared row the whole test binary's `connect()` calls race on.
+    /// Production always calls this with `"store_meta"`.
+    fn read_prior_version(conn: &mut PooledConn, table: &str) -> StoreResult<u32> {
+        match conn
+            .query_first::<Option<String>, _>(format!(
+                "SELECT v FROM {table} WHERE k = 'schema_version'"
+            ))
+            .map_err(store_err)?
+            .flatten()
+        {
+            None => Ok(0),
+            Some(v) => v.parse().map_err(|e| {
+                store_err(format!(
+                    "store_meta.schema_version is corrupt (not a valid version number): {v:?} ({e})"
+                ))
+            }),
+        }
+    }
+
     fn try_init_schema(pool: &Pool) -> StoreResult<()> {
         let mut conn = pool.get_conn().map_err(store_err)?;
 
-        // Read the version this database was AT before this boot — BEFORE the `CREATE TABLE IF NOT
-        // EXISTS store_meta` below (harmless either way, since a fresh database has no `store_meta`
-        // row yet) and BEFORE any schema statement runs, so a version-gated backfill below can tell
-        // "this database predates v2" from "this database was created fresh already at v2" (a fresh
-        // install has no pre-migration rows to backfill, and must not have the (harmless but
-        // pointless) backfill UPDATE run against it either).
-        let prior_version: u32 = conn
-            .query_first::<Option<String>, _>(
-                "SELECT v FROM store_meta WHERE k = 'schema_version'",
-            )
-            .unwrap_or(None)
-            .flatten()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        // `read_prior_version` needs `store_meta` to already exist -- create it FIRST (SCHEMA[0],
+        // `IF NOT EXISTS` so harmless to re-run when the full loop below reaches it again) so a
+        // genuinely fresh database's read is a real "no row" (Ok(None) -> version 0), not a
+        // "table doesn't exist" query ERROR that read_prior_version's error-propagation would now
+        // (correctly, for every OTHER failure) treat as a hard failure.
+        conn.query_drop(SCHEMA[0]).map_err(store_err)?;
+        let prior_version = Self::read_prior_version(&mut conn, "store_meta")?;
 
         for stmt in SCHEMA {
             // IF NOT EXISTS on tables; CREATE INDEX has no IF NOT EXISTS in MySQL/MariaDB, so a
