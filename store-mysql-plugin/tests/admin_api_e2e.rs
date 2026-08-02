@@ -40,6 +40,22 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Cleans up the REAL minted row (by its real random id) on drop -- including on panic-unwind, since
+/// Rust runs local guards' `Drop` during a panicking stack unwind. The pre-test `cleanup()` call
+/// below only ever targets a fixed, never-actually-used id (the admin API mints its own random one),
+/// so without this guard a failed assertion between mint and test-end permanently leaks the minted
+/// row: no future run's pre-test cleanup could ever find or remove it. Mirrors `ChildGuard` above.
+struct CleanupGuard {
+    url: String,
+    id: String,
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        cleanup(&self.url, &self.id);
+    }
+}
+
 fn mysql_url() -> Option<String> {
     match std::env::var("BUSBAR_TEST_MYSQL_URL") {
         Ok(url) => Some(url),
@@ -140,6 +156,65 @@ fn cleanup(url: &str, id: &str) {
     }
 }
 
+/// Proves `CleanupGuard` actually cleans up on a PANICKING exit, not just the normal-return path --
+/// direct SQL against a real row, bypassing the (expensive, real-binary-building) full e2e flow, so
+/// this stays fast. Regression coverage for the leaked-row-on-assertion-failure gap the guard closes.
+#[test]
+fn cleanup_guard_removes_the_row_even_when_the_scope_holding_it_panics() {
+    let Some(url) = mysql_url() else { return };
+    let id = format!(
+        "vk_cleanupguard_panic_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    let pool = mysql::Pool::new(mysql::Opts::from_url(&url).unwrap()).unwrap();
+    let mut conn = pool.get_conn().unwrap();
+    conn.exec_drop(
+        "INSERT INTO api_keys \
+         (id, name, key_group, allowed_pools, labels, enabled, generation_hash, \
+          created_at, updated_at, expires_at, deleted_at, revision) \
+         VALUES (:id, 'cleanup-guard-test', '', NULL, '{}', 1, '', 1000, 1000, NULL, NULL, 0)",
+        params! { "id" => &id },
+    )
+    .unwrap();
+
+    let exists = |conn: &mut mysql::PooledConn, id: &str| -> bool {
+        conn.exec_first::<u8, _, _>(
+            "SELECT 1 FROM api_keys WHERE id=:id",
+            params! { "id" => id },
+        )
+        .unwrap()
+        .is_some()
+    };
+    assert!(
+        exists(&mut conn, &id),
+        "sanity: the row must exist before the panic test"
+    );
+
+    // Run inside catch_unwind so this test itself doesn't fail -- the panic is the whole point (it's
+    // what proves the guard's Drop actually fires during a real unwind, not just a clean return).
+    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = CleanupGuard {
+            url: url.clone(),
+            id: id.clone(),
+        };
+        panic!("deliberate panic while the guard is in scope -- proves Drop still runs");
+    }));
+    assert!(
+        panic_result.is_err(),
+        "the inner closure must have actually panicked"
+    );
+
+    assert!(
+        !exists(&mut conn, &id),
+        "CleanupGuard's Drop must have removed the row even though the scope panicked"
+    );
+}
+
 fn wait_for_admin_listener(
     client: &reqwest::blocking::Client,
     admin_base: &str,
@@ -183,6 +258,11 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
 
     let (busbar_bin, pack_bin) = build_real_binaries();
 
+    // Same pid+nanosecond-timestamp uniqueness pattern as store-mysql's own
+    // `unique_scratch_table` (store-mysql/src/tests.rs) -- not shared, deliberately: that helper
+    // lives inside `#[cfg(test)] mod tests`, invisible outside store-mysql's own test compilation
+    // (cfg(test) doesn't cross a crate boundary), and promoting a 6-line helper to real `pub` API
+    // just to dedupe it here would add public surface nobody else needs.
     let work = std::env::temp_dir().join(format!(
         "busbar-mysql-adminapi-{}-{}",
         std::process::id(),
@@ -385,22 +465,40 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
         .unwrap();
     let mint_status = mint_resp.status();
     let mint_json: serde_json::Value = mint_resp.json().unwrap();
+    // A panic message below must never dump `mint_json` verbatim -- it carries the real (albeit
+    // test-generated) `aws_secret_access_key` value, and a failed assertion here would otherwise
+    // leak it into CI logs. Redact before ever interpolating the body into an assertion message.
+    let mut redacted_mint_json = mint_json.clone();
+    if let Some(obj) = redacted_mint_json.as_object_mut() {
+        if obj.contains_key("aws_secret_access_key") {
+            obj.insert(
+                "aws_secret_access_key".into(),
+                serde_json::json!("<redacted>"),
+            );
+        }
+    }
     assert_eq!(
         mint_status.as_u16(),
         201,
-        "minting a key over the real admin API must succeed: {mint_json}"
+        "minting a key over the real admin API must succeed: {redacted_mint_json}"
     );
     let minted_id = mint_json["id"]
         .as_str()
         .expect("minted key response has an id")
         .to_string();
+    // From here on a real row exists under `minted_id` -- this guard cleans it up on any exit path,
+    // including a panicking assertion below, so a test failure can never permanently leak the row.
+    let _cleanup_guard = CleanupGuard {
+        url: url.clone(),
+        id: minted_id.clone(),
+    };
     let access_key_id = mint_json["aws_access_key_id"]
         .as_str()
         .expect("issue_aws_credential:true must return an aws_access_key_id")
         .to_string();
     assert!(
         mint_json["aws_secret_access_key"].is_string(),
-        "issue_aws_credential:true must also return an aws_secret_access_key: {mint_json}"
+        "issue_aws_credential:true must also return an aws_secret_access_key: {redacted_mint_json}"
     );
 
     // INDEPENDENT VERIFICATION: a fresh RAW mysql::Pool, bypassing the plugin/ABI/admin-API
@@ -436,5 +534,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
     drop(guard2);
     drop(conn);
     let _ = std::fs::remove_dir_all(&work);
-    cleanup(&url, &minted_id);
+    // Real cleanup-of-the-minted-row now happens via `_cleanup_guard`'s Drop (fires here on the
+    // normal path, and would already have fired on any earlier panicking return too).
 }
