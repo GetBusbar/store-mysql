@@ -194,11 +194,21 @@ impl MysqlStore {
     /// process fleet booting simultaneously) is what exhausts MySQL's default `max_connections`.
     pub fn connect(url: &str) -> StoreResult<Self> {
         let opts = Opts::from_url(url).map_err(store_err)?;
-        let opts = mysql::OptsBuilder::from_opts(opts).pool_opts(
-            mysql::PoolOpts::default().with_constraints(
-                mysql::PoolConstraints::new(1, 8).expect("1 <= 8 is a valid pool constraint"),
-            ),
-        );
+        let opts = mysql::OptsBuilder::from_opts(opts)
+            .pool_opts(
+                mysql::PoolOpts::default().with_constraints(
+                    mysql::PoolConstraints::new(1, 8).expect("1 <= 8 is a valid pool constraint"),
+                ),
+            )
+            // ESTABLISH strict mode on every connection this pool ever creates -- including a
+            // reconnect after a dropped connection, or the pool growing past the one connection
+            // `probe_invariants` (below) checks at boot -- rather than verifying it once and
+            // trusting every future connection inherits the same posture. Appends (never replaces)
+            // to whatever sql_mode the server/session already carries, so an operator's other
+            // modes survive. CHECK-constraint enforcement (the other boot-probe invariant) is a
+            // server-wide, not session-scoped, property -- it can't diverge per connection the way
+            // sql_mode can, so the one-time probe below remains sufficient for that half.
+            .init(vec!["SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')"]);
         let pool = Pool::new(opts).map_err(store_err)?;
 
         Self::init_schema(&pool)?;

@@ -560,3 +560,247 @@ fn is_check_constraint_violation_accepts_only_the_two_real_engine_codes() {
 // existing direct-call tests above) remains open pending either a `connect()` variant testable with
 // injectable Opts, or the mysql crate exposing a per-connection init hook through URL parsing.
 
+/// `connect()` now ESTABLISHES strict sql_mode on every connection via `OptsBuilder::init(...)`
+/// (appended, not just verified once at boot) rather than trusting every future pooled/reconnected
+/// connection inherits the same session posture the one boot-time probe happened to see. Proves the
+/// exact init statement `connect()` uses actually WORKS even when the underlying default would be
+/// permissive -- self-contained (a throwaway pool this test builds itself, never the shared server
+/// global default), so no cross-test interference risk like the reverted GLOBAL-flip attempt above.
+#[test]
+fn connect_establishes_strict_sql_mode_via_init_even_when_the_default_would_be_permissive() {
+    let Some(url) = test_url() else { return };
+    let opts = Opts::from_url(&url).unwrap();
+    let opts = mysql::OptsBuilder::from_opts(opts).init(vec![
+        // Simulates a permissive starting session (as if the server's own default were empty) --
+        // then the SAME append statement connect() itself uses. Both run, in order, on THIS
+        // pool's own connections only; never touches the real shared server default.
+        "SET SESSION sql_mode = ''",
+        "SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')",
+    ]);
+    let pool = Pool::new(opts).unwrap();
+    let mut conn = pool.get_conn().unwrap();
+    let sql_mode: String = conn.query_first("SELECT @@sql_mode").unwrap().unwrap();
+    assert!(
+        sql_mode.contains("STRICT_ALL_TABLES"),
+        "the init-time append must land even starting from an empty sql_mode: got '{sql_mode}'"
+    );
+}
+
+// ── Lock ordering ─────────────────────────────────────────────────────────────────────────────────
+
+/// `delete_key`/`scrub_key` must lock `store_sequence` (via `bump_revision`) BEFORE locking the
+/// `api_keys` row, matching every other control-plane transaction (`put_key`, `put_credential`,
+/// `revoke_credential`) — that fixed order is what the module doc claims makes deadlock across the
+/// admin plane structurally impossible. Proves it by racing a tight loop of `put_key` against a tight
+/// loop of `delete_key`+re-`put_key` (to keep the key alive for the next iteration) on the SAME row
+/// from concurrent threads: if the two lock acquisitions ever ran in opposite order, MySQL's deadlock
+/// detector would abort one side with a real "Deadlock found" error under this contention.
+#[test]
+fn delete_and_put_on_the_same_key_never_deadlock_under_concurrency() {
+    let Some(s) = fresh_store() else { return };
+    let id = "vk_lock_order_race";
+    s.put_key(&sample_key(id, "g0")).unwrap();
+
+    let put_store = MysqlStore::connect(&test_url().unwrap()).unwrap();
+    let del_store = MysqlStore::connect(&test_url().unwrap()).unwrap();
+
+    let putter = std::thread::spawn(move || {
+        for i in 0..150 {
+            put_store
+                .put_key(&sample_key(id, &format!("g{i}")))
+                .unwrap();
+        }
+    });
+    let deleter = std::thread::spawn(move || {
+        for _ in 0..150 {
+            // delete then immediately resurrect so the putter always has a live row to race against.
+            del_store.delete_key(id).unwrap();
+            del_store.put_key(&sample_key(id, "g_resurrect")).unwrap();
+        }
+    });
+
+    putter.join().expect("put_key thread must not panic/error");
+    deleter
+        .join()
+        .expect("delete_key thread must not panic/error");
+}
+
+// ── Schema v2 migration: hydrate_budgets billing-bug backfill ──────────────────────────────────────
+//
+// Both tests below run the backfill against a PRIVATE, uniquely-named scratch table, never the real
+// shared `usage_windows` every other concurrently-running test also writes to. Two approaches were
+// tried and rejected first:
+//   1. Mutate the real `store_meta.schema_version` row and reconnect via `MysqlStore::connect()` —
+//      that row is a single GLOBAL singleton shared by the whole test binary (unlike every other row
+//      in this suite, which is scoped by a unique key id and so never collides even under
+//      `fresh_store()`'s documented parallel execution); any OTHER concurrently-running test's own
+//      `connect()` unconditionally overwrites it back to the current `SCHEMA_VERSION`, racing a
+//      deliberately-lowered test marker in both directions (reproduced: one run backfilled a row
+//      that should have been left alone, another failed to backfill one that should have been
+//      touched).
+//   2. Call `run_v2_backfill_if_needed` directly against the real `usage_windows` table — the
+//      production UPDATE is correctly UNSCOPED (a real one-time boot migration touches the whole
+//      table, matching store-postgres/store-sqlite exactly), so calling it directly during a
+//      concurrently-running suite corrupts OTHER tests' legitimate `billable_requests=0` rows
+//      (reproduced: unrelated tests like `put_and_get_usage_roundtrips` started failing).
+// Unlike store-postgres's own equivalent test (which isolates via a throwaway DATABASE per test),
+// the `busbar` CI user has no `CREATE DATABASE` privilege (confirmed: `ERROR 1044 Access denied for
+// user 'busbar'@'%'`) — only table-level DDL within the one shared database, which is what
+// `run_v2_backfill_if_needed`'s `table` parameter exists to target here.
+
+fn unique_scratch_table(name: &str) -> String {
+    format!(
+        "scratch_{name}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+/// A row created before v2 (`billable_requests = 0` purely because this store didn't track the
+/// split yet, not because of a genuine refund) must be backfilled to `billable_requests = requests`
+/// when the database predates v2 (`prior_version` 1..2).
+#[test]
+fn migrate_v2_backfills_billable_requests_for_a_pre_migration_row() {
+    let Some(s) = fresh_store() else { return };
+    let table = unique_scratch_table("premigration");
+
+    let mut conn = s.pool.get_conn().unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (
+            bucket_id VARCHAR(64) NOT NULL,
+            window_start BIGINT NOT NULL,
+            requests BIGINT NOT NULL DEFAULT 0,
+            billable_requests BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (bucket_id, window_start)
+        ) ENGINE=InnoDB"
+    ))
+    .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (bucket_id, window_start, requests, billable_requests) \
+         VALUES ('vk_premigration_v2', 5000, 7, 0)"
+    ))
+    .unwrap();
+
+    MysqlStore::run_v2_backfill_if_needed(&mut conn, 1, &table)
+        .expect("the v2 backfill must succeed against a prior_version=1 database");
+
+    let (requests, billable): (u64, u64) = conn
+        .query_first(format!(
+            "SELECT requests, billable_requests FROM {table} \
+             WHERE bucket_id='vk_premigration_v2' AND window_start=5000"
+        ))
+        .unwrap()
+        .unwrap();
+    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
+    assert_eq!(requests, 7, "the backfill must never touch `requests`");
+    assert_eq!(
+        billable, 7,
+        "a pre-v2 row's billable_requests must be backfilled to equal requests"
+    );
+}
+
+/// A row with `billable_requests = 0` that already lives on an at-or-past-v2 database (i.e. a
+/// genuine full refund/discount, not a pre-v2 artifact) must NOT be touched — gated on
+/// `prior_version >= 2` (already migrated) as well as `prior_version == 0` (a brand-new database
+/// with no pre-migration rows to backfill in the first place).
+#[test]
+fn migrate_v2_does_not_touch_a_row_when_the_database_is_not_pre_v2() {
+    let Some(s) = fresh_store() else { return };
+    let table = unique_scratch_table("norerun");
+
+    let mut conn = s.pool.get_conn().unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (
+            bucket_id VARCHAR(64) NOT NULL,
+            window_start BIGINT NOT NULL,
+            requests BIGINT NOT NULL DEFAULT 0,
+            billable_requests BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (bucket_id, window_start)
+        ) ENGINE=InnoDB"
+    ))
+    .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (bucket_id, window_start, requests, billable_requests) \
+         VALUES ('vk_already_v2_refund', 6000, 9, 0)"
+    ))
+    .unwrap();
+
+    MysqlStore::run_v2_backfill_if_needed(&mut conn, 2, &table)
+        .expect("a no-op call at prior_version=2 must still succeed");
+    MysqlStore::run_v2_backfill_if_needed(&mut conn, 0, &table)
+        .expect("a no-op call at prior_version=0 (fresh database) must still succeed");
+
+    let (requests, billable): (u64, u64) = conn
+        .query_first(format!(
+            "SELECT requests, billable_requests FROM {table} \
+             WHERE bucket_id='vk_already_v2_refund' AND window_start=6000"
+        ))
+        .unwrap()
+        .unwrap();
+    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
+    assert_eq!(requests, 9);
+    assert_eq!(
+        billable, 0,
+        "a genuine billable_requests=0 row must survive both no-op calls untouched"
+    );
+}
+
+// ── read_prior_version: real query errors must not collapse into "fresh install" ───────────────────
+
+fn scratch_meta_table(conn: &mut PooledConn, name: &str) -> String {
+    let table = unique_scratch_table(name);
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (k VARCHAR(191) PRIMARY KEY, v TEXT NOT NULL) ENGINE=InnoDB"
+    ))
+    .unwrap();
+    table
+}
+
+#[test]
+fn read_prior_version_is_zero_when_no_row_exists_yet() {
+    let Some(s) = fresh_store() else { return };
+    let mut conn = s.pool.get_conn().unwrap();
+    let table = scratch_meta_table(&mut conn, "noversion");
+    let v = MysqlStore::read_prior_version(&mut conn, &table).unwrap();
+    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
+    assert_eq!(v, 0, "no schema_version row yet must read as version 0, not an error");
+}
+
+#[test]
+fn read_prior_version_parses_a_real_stored_value() {
+    let Some(s) = fresh_store() else { return };
+    let mut conn = s.pool.get_conn().unwrap();
+    let table = scratch_meta_table(&mut conn, "realversion");
+    conn.query_drop(format!(
+        "INSERT INTO {table} (k, v) VALUES ('schema_version', '1')"
+    ))
+    .unwrap();
+    let v = MysqlStore::read_prior_version(&mut conn, &table).unwrap();
+    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
+    assert_eq!(v, 1);
+}
+
+/// RED without the fix: the old code's `.and_then(|v| v.parse().ok()).unwrap_or(0)` silently turns
+/// a corrupt, non-numeric stored value into version 0 (indistinguishable from "fresh install") --
+/// exactly the "looks already migrated but isn't" failure mode the module doc warns against, just
+/// approached from a different angle (a corrupt marker instead of a query error). A corrupt marker
+/// must hard-fail, not silently default.
+#[test]
+fn read_prior_version_hard_fails_on_a_corrupt_stored_value() {
+    let Some(s) = fresh_store() else { return };
+    let mut conn = s.pool.get_conn().unwrap();
+    let table = scratch_meta_table(&mut conn, "corruptversion");
+    conn.query_drop(format!(
+        "INSERT INTO {table} (k, v) VALUES ('schema_version', 'not-a-number')"
+    ))
+    .unwrap();
+    let result = MysqlStore::read_prior_version(&mut conn, &table);
+    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
+    assert!(
+        result.is_err(),
+        "a corrupt (non-numeric) schema_version value must hard-fail, not silently read as 0"
+    );
+}
