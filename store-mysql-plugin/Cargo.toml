@@ -9,7 +9,13 @@ description = "First-party signed kind:store plugin cdylib: the MySQL/MariaDB ba
 license = "Apache-2.0"
 
 [lib]
-crate-type = ["cdylib"]   # cdylib for the C ABI delivery; all the SQL/logic lives in busbar-store-mysql
+# cdylib for the C ABI delivery (all the SQL/logic lives in busbar-store-mysql); rlib matches the
+# sibling plugins' convention (store-postgres-plugin, auth-oidc-plugin, webrequest-hook) and is
+# REQUIRED for `cargo test` to actually emit the cdylib artifact at all — with cdylib-only, `cargo
+# test --workspace` builds a trivial "0 tests" harness for this package but never produces the
+# .so/.dylib, so an e2e test's own dlopen of its "real built cdylib" silently finds nothing (the
+# exact bug store-postgres-plugin's own Cargo.toml documents hitting and fixing the same way).
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # busbar-store-mysql is a SAME-REPO sibling crate (this plugin brings 100% of what it needs — the
@@ -22,7 +28,14 @@ busbar-plugin-sdk = { path = "../../busbarAI/crates/plugin-sdk" }
 serde_json = "1"
 
 [dev-dependencies]
-# INTERIM local path deps into busbarAI, same rationale as above — dev-only (the end-to-end test
-# loads the built cdylib over the real loader ABI seam), never shipped in the plugin artifact itself.
+# INTERIM local path deps into busbarAI, same rationale as above — dev-only (the end-to-end tests
+# load the built cdylib over the real loader ABI seam, and admin_api_e2e.rs independently re-verifies
+# persistence via the plain MysqlStore — already a normal dependency above — bypassing the cdylib/ABI
+# entirely), never shipped in the plugin artifact itself.
 busbar-plugin-loader = { path = "../../busbarAI/crates/plugin-loader" }
 mysql = { version = "26", default-features = false, features = ["minimal"] }
+# For admin_api_e2e.rs: drives the real busbar admin HTTP API (install/mint) against an
+# OUT-OF-PROCESS busbar, fully synchronous (no tokio runtime — matches store-postgres-plugin's own
+# admin_api_e2e.rs rationale for `reqwest::blocking`).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+base64 = "0.22"

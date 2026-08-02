@@ -61,7 +61,19 @@ fn store_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError(e.to_string())
 }
 
-const SCHEMA_VERSION: &str = "1";
+/// Numeric, not the original `&str`: `try_init_schema` needs to compare "the version this database
+/// was AT before this boot" against this constant to decide which one-time migration steps below
+/// have already run, and `"1" < "2"` string-comparison stops being safe the moment version numbers
+/// reach two digits.
+const SCHEMA_VERSION: u32 = 3;
+
+/// The version each one-time migration step targets crossing INTO — named so a gate reads as "did
+/// this database predate step N" rather than a bare magic number, and so a future step can't be
+/// accidentally gated on `< SCHEMA_VERSION` (wrong: that would re-fire EVERY prior step, not just
+/// the newest one, every time SCHEMA_VERSION bumps again — each step must stay pinned to the one
+/// version boundary it actually closes).
+const V2_BILLABLE_REQUESTS_BACKFILL: u32 = 2;
+const V3_KEY_GROUP_AT_USE_ASCII_BIN: u32 = 3;
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS store_meta (
@@ -146,7 +158,7 @@ const SCHEMA: &[&str] = &[
         key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
         provider VARCHAR(128) NOT NULL,
         model VARCHAR(256) NOT NULL,
-        key_group_at_use VARCHAR(128) NOT NULL DEFAULT '',
+        key_group_at_use VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
         pricing_version VARCHAR(64) NOT NULL DEFAULT '',
         requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
         billable_requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
@@ -190,11 +202,21 @@ impl MysqlStore {
     /// process fleet booting simultaneously) is what exhausts MySQL's default `max_connections`.
     pub fn connect(url: &str) -> StoreResult<Self> {
         let opts = Opts::from_url(url).map_err(store_err)?;
-        let opts = mysql::OptsBuilder::from_opts(opts).pool_opts(
-            mysql::PoolOpts::default().with_constraints(
+        let opts = mysql::OptsBuilder::from_opts(opts)
+            .pool_opts(mysql::PoolOpts::default().with_constraints(
                 mysql::PoolConstraints::new(1, 8).expect("1 <= 8 is a valid pool constraint"),
-            ),
-        );
+            ))
+            // ESTABLISH strict mode on every connection this pool ever creates -- including a
+            // reconnect after a dropped connection, or the pool growing past the one connection
+            // `probe_invariants` (below) checks at boot -- rather than verifying it once and
+            // trusting every future connection inherits the same posture. Appends (never replaces)
+            // to whatever sql_mode the server/session already carries, so an operator's other
+            // modes survive. CHECK-constraint enforcement (the other boot-probe invariant) is a
+            // server-wide, not session-scoped, property -- it can't diverge per connection the way
+            // sql_mode can, so the one-time probe below remains sufficient for that half.
+            .init(vec![
+                "SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')",
+            ]);
         let pool = Pool::new(opts).map_err(store_err)?;
 
         Self::init_schema(&pool)?;
@@ -228,8 +250,150 @@ impl MysqlStore {
         unreachable!("loop always returns on the final attempt")
     }
 
+    /// v2 one-time backfill, closing the SAME `hydrate_budgets` billing bug store-postgres's own v6
+    /// backfill closes (busbarAI core's `crates/busbar/src/governance/state.rs`): pre-v2 rows may
+    /// have `billable_requests = 0` alongside a real, positive `requests` count purely because this
+    /// store didn't track the split before v2, never because of a genuine refund/discount. Trusting
+    /// `billable_requests` unconditionally (as `hydrate_budgets` now does) needs those historical
+    /// rows backfilled once, here, at the source — never re-derived from `requests` at read time by
+    /// a heuristic (that heuristic is exactly the bug being closed). Only fires when crossing INTO v2
+    /// from a database that genuinely predates it (`prior_version < 2` and `prior_version > 0`, i.e.
+    /// `store_meta` already existed with an old value) — a brand-new v1-absent database has no
+    /// pre-migration rows and must not run this pointless no-op.
+    ///
+    /// Takes `prior_version` as an explicit argument rather than reading `store_meta` itself, purely
+    /// so the migration tests can call this directly with a hardcoded version and never have to
+    /// mutate the single GLOBAL `store_meta.schema_version` row the whole shared test-server
+    /// suite reads/writes on every `connect()` — that mutation approach was tried first and produced
+    /// a real, reproduced race (any concurrently-running test's own `connect()` unconditionally
+    /// overwrites `schema_version` back to current, racing a test's deliberately-lowered marker).
+    ///
+    /// Also takes `table` rather than hardcoding `usage_windows`, again purely for test isolation:
+    /// unlike store-postgres's own equivalent test (which runs each migration test against its own
+    /// throwaway DATABASE), the CI `busbar` MySQL user has no `CREATE DATABASE` privilege (confirmed:
+    /// `ERROR 1044 Access denied for user 'busbar'@'%' to database ...` — the official mysql image's
+    /// `MYSQL_USER` mechanism only grants `ALL PRIVILEGES` on the one `MYSQL_DATABASE`, not globally)
+    /// — table-level isolation within that one shared database is the only DDL this user can do, and
+    /// it's real DDL the rest of this crate's suite already exercises freely. Production always calls
+    /// this with `"usage_windows"`; the table parameter exists ONLY so a test can point it at a
+    /// private scratch table instead of racing every other concurrently-running test's legitimate
+    /// writes to the real, shared `usage_windows`.
+    ///
+    /// KNOWN, DOCUMENTED, NOT-YET-CLOSED GAP (found in `/codeaudit`, confirmed by two independent
+    /// adversarial design reviews — do not "fix" this with a lock; both reviews independently showed
+    /// a lock here is the wrong tool, see below): this UPDATE is UNSCOPED and assumes "a one-time
+    /// boot migration runs before any concurrent traffic exists" — true for a full-fleet restart, but
+    /// this store's own target topology is a ROLLING upgrade (README: multiple busbar nodes sharing
+    /// one MySQL server). In a rolling upgrade, some nodes are ALREADY LIVE on v2 — genuinely writing
+    /// `billable_requests > 0` via real traffic — while another node is still booting and about to
+    /// run this backfill. If live traffic reaches a still-pre-v2 row before this UPDATE does, the
+    /// predicate (`billable_requests = 0 AND requests > 0`) no longer matches it, and that row's
+    /// PRE-v2 historical `requests` are PERMANENTLY never reclassified as billable — a silent,
+    /// unrepairable billing undercount, i.e. exactly the `hydrate_budgets` bug class this migration
+    /// exists to close, reintroduced by a race in the migration itself. A `GET_LOCK`-based fix was
+    /// designed and rejected in review: it can only serialize NODES STILL BOOTING against each
+    /// other (the backfill's own re-run is already idempotent, so that case was never actually
+    /// unsafe) — it does nothing for a node that is ALREADY LIVE and never touches this function at
+    /// all, which is the actual race. Closing this for real needs pre-v2 rows to be identifiable by
+    /// something live traffic cannot change (a captured `window_start`/time cutoff, or a per-row
+    /// provenance marker) — real redesign work, out of scope for this pass. OPERATIONAL MITIGATION
+    /// until that redesign lands: either pause the whole fleet briefly for a v1->v2 upgrade
+    /// specifically (not required for any OTHER version bump), or re-run this same predicate as a
+    /// manual reconciliation query after a rolling upgrade completes — safe to do since the
+    /// predicate is idempotent (a row already at `billable_requests > 0` never matches it again).
+    /// See `characterize_v2_backfill_loses_a_row_to_a_racing_live_write` below for a reproduction.
+    fn run_v2_backfill_if_needed(
+        conn: &mut PooledConn,
+        prior_version: u32,
+        table: &str,
+    ) -> StoreResult<()> {
+        if prior_version > 0 && prior_version < V2_BILLABLE_REQUESTS_BACKFILL {
+            // Batched (LIMIT 5000 per statement, looped until exhausted), matching the same
+            // bounded-batch convention purge_windows_before/purge_metering_before already use
+            // elsewhere in this file -- an unbounded single UPDATE across the whole table risks
+            // holding its lock/scan for a long time on a large production table, worse than
+            // necessary even for a one-time migration.
+            loop {
+                conn.query_drop(format!(
+                    "UPDATE {table} SET billable_requests = requests \
+                     WHERE billable_requests = 0 AND requests > 0 LIMIT 5000"
+                ))
+                .map_err(store_err)?;
+                if conn.affected_rows() < 5000 {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// v3: `usage_metering.key_group_at_use` shipped in v1.0.0 without `ascii_bin` (inherited
+    /// MySQL's default case-INSENSITIVE collation) -- a real gap against this crate's own stated
+    /// invariant that every opaque identifier/group-name column gets byte-exact comparison. The
+    /// `CREATE TABLE IF NOT EXISTS` fix to the schema (above) only affects a FRESH database; any
+    /// database that already ran `try_init_schema` before this fix shipped has the table already
+    /// created with the wrong collation, so a real `ALTER TABLE` is required to close it on upgrade.
+    /// Idempotent: MODIFY COLUMN to the same collation it's already at is a harmless no-op on a
+    /// database created fresh (already ascii_bin) or one already migrated past v3.
+    ///
+    /// Same `table` parameter for test isolation as `run_v2_backfill_if_needed` -- see that
+    /// function's doc comment for why (no `CREATE DATABASE` privilege in CI).
+    fn run_v3_ascii_bin_fix_if_needed(
+        conn: &mut PooledConn,
+        prior_version: u32,
+        table: &str,
+    ) -> StoreResult<()> {
+        if prior_version > 0 && prior_version < V3_KEY_GROUP_AT_USE_ASCII_BIN {
+            conn.query_drop(format!(
+                "ALTER TABLE {table} MODIFY COLUMN key_group_at_use \
+                 VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT ''"
+            ))
+            .map_err(store_err)?;
+        }
+        Ok(())
+    }
+
+    /// Read the version this database was AT before this boot from `store_meta`, tolerating "no row
+    /// yet" (a genuinely fresh database, or one already at v2 that never needed a marker written
+    /// pre-v2) as version 0, but propagating any OTHER query failure (a connection blip, a lock
+    /// timeout) instead of silently treating it identically to "fresh install" -- collapsing those
+    /// two outcomes previously meant a transient failure here permanently marked a possibly-
+    /// unmigrated database as migrated (schema_version still got written unconditionally right
+    /// after). A stored value that fails to parse as a version number is ALSO now a hard error
+    /// rather than a silent 0 -- a corrupt marker is exactly the kind of "looks fine, isn't" state
+    /// this store's own boot-probe philosophy (module doc, above) says must hard-fail, not warn.
+    /// Takes `table` rather than hardcoding `store_meta`, purely for test isolation -- same reason
+    /// `run_v2_backfill_if_needed` takes its own `table` param (see that function's doc comment):
+    /// `store_meta` is a single shared row the whole test binary's `connect()` calls race on.
+    /// Production always calls this with `"store_meta"`.
+    fn read_prior_version(conn: &mut PooledConn, table: &str) -> StoreResult<u32> {
+        match conn
+            .query_first::<Option<String>, _>(format!(
+                "SELECT v FROM {table} WHERE k = 'schema_version'"
+            ))
+            .map_err(store_err)?
+            .flatten()
+        {
+            None => Ok(0),
+            Some(v) => v.parse().map_err(|e| {
+                store_err(format!(
+                    "store_meta.schema_version is corrupt (not a valid version number): {v:?} ({e})"
+                ))
+            }),
+        }
+    }
+
     fn try_init_schema(pool: &Pool) -> StoreResult<()> {
         let mut conn = pool.get_conn().map_err(store_err)?;
+
+        // `read_prior_version` needs `store_meta` to already exist -- create it FIRST (SCHEMA[0],
+        // `IF NOT EXISTS` so harmless to re-run when the full loop below reaches it again) so a
+        // genuinely fresh database's read is a real "no row" (Ok(None) -> version 0), not a
+        // "table doesn't exist" query ERROR that read_prior_version's error-propagation would now
+        // (correctly, for every OTHER failure) treat as a hard failure.
+        conn.query_drop(SCHEMA[0]).map_err(store_err)?;
+        let prior_version = Self::read_prior_version(&mut conn, "store_meta")?;
+
         for stmt in SCHEMA {
             // IF NOT EXISTS on tables; CREATE INDEX has no IF NOT EXISTS in MySQL/MariaDB, so a
             // "duplicate key name" error on re-run (schema already applied) is swallowed here —
@@ -243,6 +407,10 @@ impl MysqlStore {
                 }
             }
         }
+
+        Self::run_v2_backfill_if_needed(&mut conn, prior_version, "usage_windows")?;
+        Self::run_v3_ascii_bin_fix_if_needed(&mut conn, prior_version, "usage_metering")?;
+
         conn.query_drop(
             "INSERT INTO store_meta (k, v) VALUES ('schema_version', :v) \
              ON DUPLICATE KEY UPDATE v = :v"
@@ -259,11 +427,21 @@ impl MysqlStore {
         Ok(())
     }
 
+    /// A rejected probe INSERT is proof of CHECK enforcement ONLY if it's the SPECIFIC
+    /// CHECK-violation error this schema's two target engines actually produce -- MySQL 8.0.16+'s
+    /// `ER_CHECK_CONSTRAINT_VIOLATED` (3819) or MariaDB's `ER_CONSTRAINT_FAILED` (4025). Any other
+    /// error (a lock timeout, a connection blip) is inconclusive and must never be silently read as
+    /// "enforced" -- that was the bug: the prior code treated ANY error as proof.
+    fn is_check_constraint_violation(e: &mysql::Error) -> bool {
+        matches!(e, mysql::Error::MySqlError(inner) if inner.code == 3819 || inner.code == 4025)
+    }
+
     /// Live functional probes for the two failure modes a schema-shape check cannot catch:
     /// (1) `CHECK` constraints parsed but not enforced (MySQL < 8.0.16, Aurora MySQL 2.x);
     /// (2) `STRICT_ALL_TABLES` not in `sql_mode` (a VARCHAR/BIGINT overflow silently truncates
-    ///     instead of erroring). Both are probed by attempting an operation that MUST fail, inside
-    ///     a transaction that's always rolled back, never committed — no probe row survives.
+    ///     instead of erroring). (1) is probed via a session-private `TEMPORARY` table (never the
+    ///     real shared schema — zero contention with real traffic or another node's simultaneous
+    ///     probe), dropped immediately after; no probe row ever touches real data.
     fn probe_invariants(conn: &mut PooledConn) -> StoreResult<()> {
         let sql_mode: String = conn
             .query_first("SELECT @@sql_mode")
@@ -277,15 +455,38 @@ impl MysqlStore {
             )));
         }
 
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
-        let rejected = tx
-            .query_drop(
-                "INSERT INTO store_sequence (id, revision) VALUES (999, 0)", // id=999 violates ck_seq_singleton (id=1)
-            )
-            .is_err();
-        let _ = tx.rollback();
+        // Session-private TEMPORARY table -- zero contention with real traffic or another node's
+        // simultaneous boot probe (unlike probing the real, shared `store_sequence` singleton row,
+        // which a concurrent live control-plane transaction, or another node probing at the same
+        // moment, could genuinely lock -- producing a lock-wait-timeout/deadlock error that has
+        // nothing to do with CHECK enforcement and would be misread as "unexpected failure"
+        // below). Auto-dropped at session end regardless; explicitly dropped here too.
+        conn.query_drop(
+            "CREATE TEMPORARY TABLE busbar_check_probe (\
+                id INT PRIMARY KEY, CONSTRAINT ck_probe CHECK (id = 1)\
+             ) ENGINE=InnoDB",
+        )
+        .map_err(store_err)?;
+        let probe_result = conn.query_drop("INSERT INTO busbar_check_probe (id) VALUES (999)");
+        let _ = conn.query_drop("DROP TEMPORARY TABLE busbar_check_probe");
+
+        // ER_CHECK_CONSTRAINT_VIOLATED (3819, MySQL 8.0.16+) / ER_CONSTRAINT_FAILED (4025,
+        // MariaDB) -- the two vendor-specific codes this schema's CHECK enforcement actually
+        // produces on the two engines this store targets (module doc: "MySQL 8.0.16+, MariaDB, and
+        // Aurora MySQL"). Any OTHER error is inconclusive and hard-fails rather than being silently
+        // read as "enforced" -- with the temp-table probe above having zero contention with real
+        // traffic, there's no remaining benign reason left for a different error here.
+        let rejected = match probe_result {
+            Ok(()) => false,
+            Err(ref e) if Self::is_check_constraint_violation(e) => true,
+            Err(e) => {
+                return Err(store_err(format!(
+                    "boot probe failed: could not determine whether CHECK constraints are enforced \
+                     — the probe INSERT failed for an unexpected reason instead of the expected \
+                     CHECK violation (MySQL code 3819 / MariaDB code 4025): {e}"
+                )));
+            }
+        };
         if !rejected {
             return Err(store_err(
                 "boot probe failed: a CHECK constraint violation was NOT rejected — this server \
@@ -867,25 +1068,47 @@ impl Store for MysqlStore {
             )));
         }
 
-        tx.exec_drop(
-            "INSERT INTO credentials
-                (id, key_id, kind, slot, public_id, secret, secret_form, created_at, updated_at,
-                 expires_at, revoked_at, revoke_reason, revision)
-             VALUES (:id, :key, :kind, :slot, :pub, :secret, :form, :created, :updated, :expires,
-                     NULL, NULL, :rev)
-             ON DUPLICATE KEY UPDATE
-                id = VALUES(id), public_id = VALUES(public_id), secret = VALUES(secret),
-                secret_form = VALUES(secret_form), updated_at = VALUES(updated_at),
-                expires_at = VALUES(expires_at), revoked_at = NULL, revoke_reason = NULL,
-                revision = VALUES(revision)",
-            params! {
-                "id" => &m.id, "key" => &m.key_id, "kind" => &m.kind, "slot" => m.slot,
-                "pub" => &m.public_id, "secret" => &secret.secret,
-                "form" => secret_form_str(&m.secret_form),
-                "created" => m.created_at, "updated" => m.updated_at, "expires" => m.expires_at,
-                "rev" => rev,
-            },
-        )
+        // `credentials` has THREE unique keys total: `id` (PRIMARY KEY), `uq_cred_public
+        // UNIQUE(kind, public_id)`, and `uq_cred_slot UNIQUE(key_id, kind, slot)` (checked above).
+        // A single `INSERT ... ON DUPLICATE KEY UPDATE` fires its UPDATE on ANY of the 3, but its
+        // SET list only ever touches `id`/`public_id`/`secret`/etc, never `key_id`/`slot` -- so a
+        // collision on `id` OR `public_id` against an UNRELATED row (different key_id/slot) would
+        // silently overwrite that row's identity/secret while leaving it pointed at the WRONG
+        // key/slot. Branching INSERT-vs-UPDATE off the slot guard above (the only unique key that
+        // legitimately gets reused, when reclaiming a revoked slot) instead of a blanket upsert
+        // means a collision on `id` or `public_id` now surfaces as a real MySQL 1062 duplicate-key
+        // error rather than a silent cross-row overwrite.
+        if occupied.is_some() {
+            // A revoked row already holds this exact (key_id, kind, slot) -- reclaim it in place.
+            tx.exec_drop(
+                "UPDATE credentials SET
+                    id = :id, public_id = :pub, secret = :secret, secret_form = :form,
+                    updated_at = :updated, expires_at = :expires, revoked_at = NULL,
+                    revoke_reason = NULL, revision = :rev
+                 WHERE key_id = :key AND kind = :kind AND slot = :slot",
+                params! {
+                    "id" => &m.id, "key" => &m.key_id, "kind" => &m.kind, "slot" => m.slot,
+                    "pub" => &m.public_id, "secret" => &secret.secret,
+                    "form" => secret_form_str(&m.secret_form),
+                    "updated" => m.updated_at, "expires" => m.expires_at, "rev" => rev,
+                },
+            )
+        } else {
+            tx.exec_drop(
+                "INSERT INTO credentials
+                    (id, key_id, kind, slot, public_id, secret, secret_form, created_at, updated_at,
+                     expires_at, revoked_at, revoke_reason, revision)
+                 VALUES (:id, :key, :kind, :slot, :pub, :secret, :form, :created, :updated, :expires,
+                         NULL, NULL, :rev)",
+                params! {
+                    "id" => &m.id, "key" => &m.key_id, "kind" => &m.kind, "slot" => m.slot,
+                    "pub" => &m.public_id, "secret" => &secret.secret,
+                    "form" => secret_form_str(&m.secret_form),
+                    "created" => m.created_at, "updated" => m.updated_at, "expires" => m.expires_at,
+                    "rev" => rev,
+                },
+            )
+        }
         .map_err(store_err)?;
 
         tx.commit().map_err(store_err)
@@ -993,6 +1216,25 @@ impl Store for MysqlStore {
             .start_transaction(TxOpts::default())
             .map_err(store_err)?;
         let rev = Self::bump_revision(&mut tx)?;
+
+        // Explicit existence check, matching every other conditional mutation in this file
+        // (e.g. put_credential's slot guard): `rows_affected()` alone can't distinguish "id
+        // doesn't exist" from "id exists but already revoked" -- the `AND revoked_at IS NULL`
+        // clause below makes both cases match zero rows. Without this, revoking an unknown/
+        // typo'd id silently reported success.
+        let existing: Option<(Option<u64>,)> = tx
+            .exec_first(
+                "SELECT revoked_at FROM credentials WHERE id = :id FOR UPDATE",
+                params! { "id" => id },
+            )
+            .map_err(store_err)?;
+        if existing.is_none() {
+            tx.rollback().map_err(store_err)?;
+            return Err(store_err(format!(
+                "revoke_credential: unknown credential id {id}"
+            )));
+        }
+
         let now = crate_now();
         tx.exec_drop(
             "UPDATE credentials SET revoked_at = :now, revoke_reason = :reason, updated_at = :now, \
