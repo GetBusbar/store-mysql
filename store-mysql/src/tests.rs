@@ -969,3 +969,165 @@ fn read_prior_version_hard_fails_on_a_corrupt_stored_value() {
         "a corrupt (non-numeric) schema_version value must hard-fail, not silently read as 0"
     );
 }
+
+/// `revoke_credential` must reject an unknown/typo'd id loudly, not silently return `Ok(())`.
+/// RED without the fix: this asserts `Err`, which the old unconditional `UPDATE ... WHERE id=:id`
+/// (never checked for a match) could not produce.
+#[test]
+fn revoke_credential_rejects_an_unknown_id() {
+    let Some(s) = fresh_store() else { return };
+    let err = s
+        .revoke_credential("cred_does_not_exist_anywhere", "cleanup")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("unknown credential id"),
+        "must name the real reason: {err}"
+    );
+}
+
+/// `put_credential` must reject a `public_id` collision against a DIFFERENT credential's id, not
+/// silently corrupt the unrelated row via `ON DUPLICATE KEY UPDATE`. RED without the fix: the old
+/// code let this succeed, overwriting the unrelated row's `id`/`secret`/etc while leaving its
+/// `key_id`/`slot` untouched.
+#[test]
+fn put_credential_rejects_a_public_id_collision_against_a_different_credential() {
+    let Some(s) = fresh_store() else { return };
+    let k1 = sample_key("vk_pubcol_a", "g");
+    let k2 = sample_key("vk_pubcol_b", "g");
+    s.put_key(&k1).unwrap();
+    s.put_key(&k2).unwrap();
+    s.put_credential(&sample_credential("vk_pubcol_a", "AKIA_SHARED_PUBID", 0))
+        .unwrap();
+
+    // A genuinely NEW credential (different id, different key_id/slot) reusing the SAME
+    // public_id must be rejected, not silently take over the first credential's identity.
+    // (sample_credential derives `id` from `public_id`, so force a DIFFERENT id explicitly --
+    // otherwise this would collide on the PRIMARY KEY too and test the wrong path.)
+    let mut colliding = sample_credential("vk_pubcol_b", "AKIA_SHARED_PUBID", 0);
+    colliding.meta.id = "cred_genuinely_different_id".to_string();
+    let err = s.put_credential(&colliding).unwrap_err();
+    // A real MySQL duplicate-key rejection on `uq_cred_public` -- dropping the blanket
+    // `ON DUPLICATE KEY UPDATE` (see put_credential's own comment) means MySQL's own constraint
+    // now catches this collision directly, same as the PRIMARY KEY case below.
+    assert!(
+        (err.to_string().contains("Duplicate entry") || err.to_string().contains("1062"))
+            && err.to_string().contains("uq_cred_public"),
+        "must be a real duplicate-key rejection on the public_id unique key: {err}"
+    );
+
+    // The FIRST credential must be completely untouched by the rejected attempt.
+    let untouched = s
+        .lookup_credential_secret("sigv4", "AKIA_SHARED_PUBID")
+        .unwrap()
+        .unwrap();
+    assert_eq!(untouched.meta.key_id, "vk_pubcol_a");
+}
+
+/// `put_credential` must also reject a PRIMARY KEY (`id`) collision against a row that belongs to
+/// a DIFFERENT `key_id`/`slot` -- the third of the table's 3 unique keys, and the one the first
+/// (public_id-only) guard attempt missed. RED without the fix: `ON DUPLICATE KEY UPDATE`'s SET
+/// list never touches `key_id`/`slot`, so this would silently overwrite the existing row's secret
+/// material while leaving it attached to the WRONG key/slot.
+#[test]
+fn put_credential_rejects_an_id_collision_against_a_different_key_or_slot() {
+    let Some(s) = fresh_store() else { return };
+    let k1 = sample_key("vk_idcol_a", "g");
+    let k2 = sample_key("vk_idcol_b", "g");
+    s.put_key(&k1).unwrap();
+    s.put_key(&k2).unwrap();
+    let original = sample_credential("vk_idcol_a", "AKIA_IDCOL_ORIG", 0);
+    s.put_credential(&original).unwrap();
+
+    // Same `id` as `original` (sample_credential derives id from public_id, so force a real
+    // collision by reusing original's id directly), but a DIFFERENT key_id/slot/public_id.
+    let mut colliding = sample_credential("vk_idcol_b", "AKIA_IDCOL_NEW", 1);
+    colliding.meta.id = original.meta.id.clone();
+    let err = s.put_credential(&colliding).unwrap_err();
+    // MySQL's own PRIMARY KEY constraint surfaces this now (a real 1062 duplicate-entry error),
+    // since the INSERT path no longer silently upserts across an id collision.
+    assert!(
+        err.to_string().contains("Duplicate entry") || err.to_string().contains("1062"),
+        "must be a real duplicate-key rejection, not a silent corruption: {err}"
+    );
+
+    // The ORIGINAL credential must be completely untouched.
+    let untouched = s
+        .lookup_credential_secret("sigv4", "AKIA_IDCOL_ORIG")
+        .unwrap()
+        .unwrap();
+    assert_eq!(untouched.meta.key_id, "vk_idcol_a");
+    assert_eq!(untouched.meta.slot, 0);
+}
+
+/// Real proof that `delete_key`'s tombstone-write and credential-destroy are ONE atomic
+/// transaction, not two: a concurrent connection contends for the SAME row lock `delete_key`
+/// holds for its whole transaction. InnoDB row locks are held for the full transaction, not
+/// released between statements, so a racer that observes the row after finding it locked can
+/// only ever see the FULLY-before or FULLY-after state -- never a window with one half done and
+/// not the other. If `delete_key` were split into two transactions, the row lock would release
+/// after the first commits, letting a racer that lands in that gap observe the broken
+/// intermediate state, which the assertion below would then catch.
+#[test]
+fn tombstone_and_credential_destruction_are_never_observed_apart() {
+    let Some(s) = fresh_store() else { return };
+    let k = sample_key("vk_atomicrace", "g");
+    let cred = sample_credential("vk_atomicrace", "AKIA_ATOMICRACE", 0);
+    s.put_key_with_credential(&k, &cred).unwrap();
+
+    let pool = s.pool.clone();
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed2 = observed.clone();
+
+    let racer = std::thread::spawn(move || {
+        let mut conn = pool.get_conn().unwrap();
+        // Bias toward the interesting (contended) case: repeatedly probe with a near-zero lock
+        // wait until we find the row genuinely locked (proof delete_key's transaction is
+        // mid-flight), then switch to a normal blocking wait so we observe the state EXACTLY as
+        // the lock releases -- never a state from before delete_key started.
+        for _ in 0..500 {
+            let mut probe = conn.start_transaction(mysql::TxOpts::default()).unwrap();
+            // NOWAIT (MySQL 8.0.1+) errors instantly instead of blocking -- a real non-blocking
+            // probe, unlike innodb_lock_wait_timeout (whose minimum valid value is 1 second).
+            let busy = probe
+                .exec_first::<Option<u64>, _, _>(
+                    "SELECT deleted_at FROM api_keys WHERE id = :id FOR UPDATE NOWAIT",
+                    params! { "id" => "vk_atomicrace" },
+                )
+                .is_err();
+            let _ = probe.rollback();
+            if busy {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        conn.query_drop("SET innodb_lock_wait_timeout = 50")
+            .unwrap();
+        let mut tx = conn.start_transaction(mysql::TxOpts::default()).unwrap();
+        let tombstoned: Option<u64> = tx
+            .exec_first(
+                "SELECT deleted_at FROM api_keys WHERE id = :id FOR UPDATE",
+                params! { "id" => "vk_atomicrace" },
+            )
+            .unwrap()
+            .flatten();
+        let cred_count: i64 = tx
+            .exec_first(
+                "SELECT COUNT(*) FROM credentials WHERE key_id = :id",
+                params! { "id" => "vk_atomicrace" },
+            )
+            .unwrap()
+            .unwrap();
+        let _ = tx.rollback();
+        *observed2.lock().unwrap() = Some((tombstoned.is_some(), cred_count));
+    });
+
+    s.delete_key("vk_atomicrace").unwrap();
+    racer.join().unwrap();
+
+    let (tombstoned, cred_count) = observed.lock().unwrap().unwrap();
+    assert!(
+        (tombstoned && cred_count == 0) || (!tombstoned && cred_count == 1),
+        "observed tombstoned={tombstoned} cred_count={cred_count} -- a window where one half of \
+         delete_key committed without the other means it is NOT one atomic transaction"
+    );
+}

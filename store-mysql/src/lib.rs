@@ -1033,25 +1033,47 @@ impl Store for MysqlStore {
             )));
         }
 
-        tx.exec_drop(
-            "INSERT INTO credentials
-                (id, key_id, kind, slot, public_id, secret, secret_form, created_at, updated_at,
-                 expires_at, revoked_at, revoke_reason, revision)
-             VALUES (:id, :key, :kind, :slot, :pub, :secret, :form, :created, :updated, :expires,
-                     NULL, NULL, :rev)
-             ON DUPLICATE KEY UPDATE
-                id = VALUES(id), public_id = VALUES(public_id), secret = VALUES(secret),
-                secret_form = VALUES(secret_form), updated_at = VALUES(updated_at),
-                expires_at = VALUES(expires_at), revoked_at = NULL, revoke_reason = NULL,
-                revision = VALUES(revision)",
-            params! {
-                "id" => &m.id, "key" => &m.key_id, "kind" => &m.kind, "slot" => m.slot,
-                "pub" => &m.public_id, "secret" => &secret.secret,
-                "form" => secret_form_str(&m.secret_form),
-                "created" => m.created_at, "updated" => m.updated_at, "expires" => m.expires_at,
-                "rev" => rev,
-            },
-        )
+        // `credentials` has THREE unique keys total: `id` (PRIMARY KEY), `uq_cred_public
+        // UNIQUE(kind, public_id)`, and `uq_cred_slot UNIQUE(key_id, kind, slot)` (checked above).
+        // A single `INSERT ... ON DUPLICATE KEY UPDATE` fires its UPDATE on ANY of the 3, but its
+        // SET list only ever touches `id`/`public_id`/`secret`/etc, never `key_id`/`slot` -- so a
+        // collision on `id` OR `public_id` against an UNRELATED row (different key_id/slot) would
+        // silently overwrite that row's identity/secret while leaving it pointed at the WRONG
+        // key/slot. Branching INSERT-vs-UPDATE off the slot guard above (the only unique key that
+        // legitimately gets reused, when reclaiming a revoked slot) instead of a blanket upsert
+        // means a collision on `id` or `public_id` now surfaces as a real MySQL 1062 duplicate-key
+        // error rather than a silent cross-row overwrite.
+        if occupied.is_some() {
+            // A revoked row already holds this exact (key_id, kind, slot) -- reclaim it in place.
+            tx.exec_drop(
+                "UPDATE credentials SET
+                    id = :id, public_id = :pub, secret = :secret, secret_form = :form,
+                    updated_at = :updated, expires_at = :expires, revoked_at = NULL,
+                    revoke_reason = NULL, revision = :rev
+                 WHERE key_id = :key AND kind = :kind AND slot = :slot",
+                params! {
+                    "id" => &m.id, "key" => &m.key_id, "kind" => &m.kind, "slot" => m.slot,
+                    "pub" => &m.public_id, "secret" => &secret.secret,
+                    "form" => secret_form_str(&m.secret_form),
+                    "updated" => m.updated_at, "expires" => m.expires_at, "rev" => rev,
+                },
+            )
+        } else {
+            tx.exec_drop(
+                "INSERT INTO credentials
+                    (id, key_id, kind, slot, public_id, secret, secret_form, created_at, updated_at,
+                     expires_at, revoked_at, revoke_reason, revision)
+                 VALUES (:id, :key, :kind, :slot, :pub, :secret, :form, :created, :updated, :expires,
+                         NULL, NULL, :rev)",
+                params! {
+                    "id" => &m.id, "key" => &m.key_id, "kind" => &m.kind, "slot" => m.slot,
+                    "pub" => &m.public_id, "secret" => &secret.secret,
+                    "form" => secret_form_str(&m.secret_form),
+                    "created" => m.created_at, "updated" => m.updated_at, "expires" => m.expires_at,
+                    "rev" => rev,
+                },
+            )
+        }
         .map_err(store_err)?;
 
         tx.commit().map_err(store_err)
@@ -1159,6 +1181,25 @@ impl Store for MysqlStore {
             .start_transaction(TxOpts::default())
             .map_err(store_err)?;
         let rev = Self::bump_revision(&mut tx)?;
+
+        // Explicit existence check, matching every other conditional mutation in this file
+        // (e.g. put_credential's slot guard): `rows_affected()` alone can't distinguish "id
+        // doesn't exist" from "id exists but already revoked" -- the `AND revoked_at IS NULL`
+        // clause below makes both cases match zero rows. Without this, revoking an unknown/
+        // typo'd id silently reported success.
+        let existing: Option<(Option<u64>,)> = tx
+            .exec_first(
+                "SELECT revoked_at FROM credentials WHERE id = :id FOR UPDATE",
+                params! { "id" => id },
+            )
+            .map_err(store_err)?;
+        if existing.is_none() {
+            tx.rollback().map_err(store_err)?;
+            return Err(store_err(format!(
+                "revoke_credential: unknown credential id {id}"
+            )));
+        }
+
         let now = crate_now();
         tx.exec_drop(
             "UPDATE credentials SET revoked_at = :now, revoke_reason = :reason, updated_at = :now, \
