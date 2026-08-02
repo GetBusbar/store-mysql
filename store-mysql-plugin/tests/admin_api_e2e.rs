@@ -135,10 +135,7 @@ fn cleanup(url: &str, id: &str) {
                 "DELETE FROM credentials WHERE key_id=:id",
                 params! { "id" => id },
             );
-            let _ = conn.exec_drop(
-                "DELETE FROM api_keys WHERE id=:id",
-                params! { "id" => id },
-            );
+            let _ = conn.exec_drop("DELETE FROM api_keys WHERE id=:id", params! { "id" => id });
         }
     }
 }
@@ -325,7 +322,9 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
     let config2 = work.join("config2.yaml");
     std::fs::write(
         &config2,
-        format!("{providers_and_common}store:\n  module: mysql\n  settings: {{ url: \"{url}\" }}\n"),
+        format!(
+            "{providers_and_common}store:\n  module: mysql\n  settings: {{ url: \"{url}\" }}\n"
+        ),
     )
     .unwrap();
 
@@ -426,8 +425,8 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
             params! { "id" => &minted_id },
         )
         .unwrap();
-    let (stored_kind, stored_public_id) =
-        cred_row.expect("the minted AWS credential must be a real row in the real credentials table");
+    let (stored_kind, stored_public_id) = cred_row
+        .expect("the minted AWS credential must be a real row in the real credentials table");
     assert_eq!(stored_kind, "sigv4");
     assert_eq!(
         stored_public_id, access_key_id,

@@ -195,11 +195,9 @@ impl MysqlStore {
     pub fn connect(url: &str) -> StoreResult<Self> {
         let opts = Opts::from_url(url).map_err(store_err)?;
         let opts = mysql::OptsBuilder::from_opts(opts)
-            .pool_opts(
-                mysql::PoolOpts::default().with_constraints(
-                    mysql::PoolConstraints::new(1, 8).expect("1 <= 8 is a valid pool constraint"),
-                ),
-            )
+            .pool_opts(mysql::PoolOpts::default().with_constraints(
+                mysql::PoolConstraints::new(1, 8).expect("1 <= 8 is a valid pool constraint"),
+            ))
             // ESTABLISH strict mode on every connection this pool ever creates -- including a
             // reconnect after a dropped connection, or the pool growing past the one connection
             // `probe_invariants` (below) checks at boot -- rather than verifying it once and
@@ -208,7 +206,9 @@ impl MysqlStore {
             // modes survive. CHECK-constraint enforcement (the other boot-probe invariant) is a
             // server-wide, not session-scoped, property -- it can't diverge per connection the way
             // sql_mode can, so the one-time probe below remains sufficient for that half.
-            .init(vec!["SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')"]);
+            .init(vec![
+                "SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')",
+            ]);
         let pool = Pool::new(opts).map_err(store_err)?;
 
         Self::init_schema(&pool)?;
@@ -267,21 +267,54 @@ impl MysqlStore {
     /// `MYSQL_USER` mechanism only grants `ALL PRIVILEGES` on the one `MYSQL_DATABASE`, not globally)
     /// — table-level isolation within that one shared database is the only DDL this user can do, and
     /// it's real DDL the rest of this crate's suite already exercises freely. Production always calls
-    /// this with `"usage_windows"`; the real, unscoped whole-table UPDATE below is exactly correct in
-    /// that context (a one-time boot migration runs before any concurrent traffic exists) — the table
-    /// parameter exists ONLY so a test can point it at a private scratch table instead of racing every
-    /// other concurrently-running test's legitimate writes to the real, shared `usage_windows`.
+    /// this with `"usage_windows"`; the table parameter exists ONLY so a test can point it at a
+    /// private scratch table instead of racing every other concurrently-running test's legitimate
+    /// writes to the real, shared `usage_windows`.
+    ///
+    /// KNOWN, DOCUMENTED, NOT-YET-CLOSED GAP (found in `/codeaudit`, confirmed by two independent
+    /// adversarial design reviews — do not "fix" this with a lock; both reviews independently showed
+    /// a lock here is the wrong tool, see below): this UPDATE is UNSCOPED and assumes "a one-time
+    /// boot migration runs before any concurrent traffic exists" — true for a full-fleet restart, but
+    /// this store's own target topology is a ROLLING upgrade (README: multiple busbar nodes sharing
+    /// one MySQL server). In a rolling upgrade, some nodes are ALREADY LIVE on v2 — genuinely writing
+    /// `billable_requests > 0` via real traffic — while another node is still booting and about to
+    /// run this backfill. If live traffic reaches a still-pre-v2 row before this UPDATE does, the
+    /// predicate (`billable_requests = 0 AND requests > 0`) no longer matches it, and that row's
+    /// PRE-v2 historical `requests` are PERMANENTLY never reclassified as billable — a silent,
+    /// unrepairable billing undercount, i.e. exactly the `hydrate_budgets` bug class this migration
+    /// exists to close, reintroduced by a race in the migration itself. A `GET_LOCK`-based fix was
+    /// designed and rejected in review: it can only serialize NODES STILL BOOTING against each
+    /// other (the backfill's own re-run is already idempotent, so that case was never actually
+    /// unsafe) — it does nothing for a node that is ALREADY LIVE and never touches this function at
+    /// all, which is the actual race. Closing this for real needs pre-v2 rows to be identifiable by
+    /// something live traffic cannot change (a captured `window_start`/time cutoff, or a per-row
+    /// provenance marker) — real redesign work, out of scope for this pass. OPERATIONAL MITIGATION
+    /// until that redesign lands: either pause the whole fleet briefly for a v1->v2 upgrade
+    /// specifically (not required for any OTHER version bump), or re-run this same predicate as a
+    /// manual reconciliation query after a rolling upgrade completes — safe to do since the
+    /// predicate is idempotent (a row already at `billable_requests > 0` never matches it again).
+    /// See `characterize_v2_backfill_loses_a_row_to_a_racing_live_write` below for a reproduction.
     fn run_v2_backfill_if_needed(
         conn: &mut PooledConn,
         prior_version: u32,
         table: &str,
     ) -> StoreResult<()> {
-        if prior_version > 0 && prior_version < 2 {
-            conn.query_drop(format!(
-                "UPDATE {table} SET billable_requests = requests \
-                 WHERE billable_requests = 0 AND requests > 0"
-            ))
-            .map_err(store_err)?;
+        if prior_version > 0 && prior_version < SCHEMA_VERSION {
+            // Batched (LIMIT 5000 per statement, looped until exhausted), matching the same
+            // bounded-batch convention purge_windows_before/purge_metering_before already use
+            // elsewhere in this file -- an unbounded single UPDATE across the whole table risks
+            // holding its lock/scan for a long time on a large production table, worse than
+            // necessary even for a one-time migration.
+            loop {
+                conn.query_drop(format!(
+                    "UPDATE {table} SET billable_requests = requests \
+                     WHERE billable_requests = 0 AND requests > 0 LIMIT 5000"
+                ))
+                .map_err(store_err)?;
+                if conn.affected_rows() < 5000 {
+                    break;
+                }
+            }
         }
         Ok(())
     }

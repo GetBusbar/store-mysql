@@ -748,6 +748,73 @@ fn migrate_v2_does_not_touch_a_row_when_the_database_is_not_pre_v2() {
     );
 }
 
+/// KNOWN, DOCUMENTED, NOT-YET-CLOSED GAP -- see `run_v2_backfill_if_needed`'s own doc comment for
+/// the full writeup and why a `GET_LOCK`-based fix (designed, then rejected in adversarial design
+/// review) doesn't actually close this. Characterizes the exact rolling-upgrade race as a
+/// deterministic ORDER-of-operations reproduction (no real thread timing needed -- the race is
+/// about which write reaches the row first, which a single-threaded test can fully control): a
+/// pre-v2 row that receives ONE legitimate real v2 write (simulating an already-live node
+/// elsewhere in the fleet) BEFORE this node's own backfill runs permanently loses its pre-v2
+/// history from ever being counted as billable.
+///
+/// `#[ignore]`d: this documents real, CURRENT behavior (confirmed failing below), not a regression
+/// to catch. Un-ignore once the provenance-based redesign `run_v2_backfill_if_needed` describes
+/// lands, at which point this assertion should start passing.
+#[test]
+#[ignore = "characterizes a known, documented, not-yet-fixed gap -- see run_v2_backfill_if_needed's doc comment"]
+fn characterize_v2_backfill_loses_a_row_to_a_racing_live_write() {
+    let Some(s) = fresh_store() else { return };
+    let table = unique_scratch_table("racecharacterize");
+
+    let mut conn = s.pool.get_conn().unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (
+            bucket_id VARCHAR(64) NOT NULL,
+            window_start BIGINT NOT NULL,
+            requests BIGINT NOT NULL DEFAULT 0,
+            billable_requests BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (bucket_id, window_start)
+        ) ENGINE=InnoDB"
+    ))
+    .unwrap();
+    // Pre-v2 history: 10 real requests, never tracked as billable (this store didn't split the
+    // counters before v2).
+    conn.query_drop(format!(
+        "INSERT INTO {table} (bucket_id, window_start, requests, billable_requests) \
+         VALUES ('vk_race', 7000, 10, 0)"
+    ))
+    .unwrap();
+
+    // A live, already-upgraded node's REAL v2 write lands FIRST -- legitimate: 2 new billable
+    // requests arrive after the upgrade, correctly tracked in lockstep by v2-aware code.
+    conn.query_drop(format!(
+        "UPDATE {table} SET requests = requests + 2, billable_requests = billable_requests + 2 \
+         WHERE bucket_id = 'vk_race' AND window_start = 7000"
+    ))
+    .unwrap();
+
+    // THEN this (still-booting) node's backfill runs.
+    MysqlStore::run_v2_backfill_if_needed(&mut conn, 1, &table).unwrap();
+
+    let (requests, billable): (u64, u64) = conn
+        .query_first(format!(
+            "SELECT requests, billable_requests FROM {table} \
+             WHERE bucket_id='vk_race' AND window_start=7000"
+        ))
+        .unwrap()
+        .unwrap();
+    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
+
+    assert_eq!(requests, 12, "sanity: 10 pre-v2 + 2 live v2 requests");
+    assert_eq!(
+        billable, 12,
+        "the pre-v2 10 requests should be reclassified as billable too -- if this fails, \
+         billable_requests stayed at 2 (only the live write's own delta) because the backfill's \
+         predicate (billable_requests = 0) no longer matched once the live write touched the row \
+         first. This is the documented, known gap in run_v2_backfill_if_needed's doc comment."
+    );
+}
+
 // ── read_prior_version: real query errors must not collapse into "fresh install" ───────────────────
 
 fn scratch_meta_table(conn: &mut PooledConn, name: &str) -> String {
@@ -766,7 +833,10 @@ fn read_prior_version_is_zero_when_no_row_exists_yet() {
     let table = scratch_meta_table(&mut conn, "noversion");
     let v = MysqlStore::read_prior_version(&mut conn, &table).unwrap();
     conn.query_drop(format!("DROP TABLE {table}")).unwrap();
-    assert_eq!(v, 0, "no schema_version row yet must read as version 0, not an error");
+    assert_eq!(
+        v, 0,
+        "no schema_version row yet must read as version 0, not an error"
+    );
 }
 
 #[test]
