@@ -31,6 +31,10 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Fixed ed25519 signing secret (64 hex = 32 bytes) for this e2e test. 1.5.1 requires an
+/// explicit signing key to mint virtual keys; busbar no longer auto-generates one.
+const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -319,7 +323,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
         "listen: \"127.0.0.1:0\"\n\
          admin_listen: \"127.0.0.1:{admin_port}\"\n\
          plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
-         auth:\n  chain: []\n  admin_auth:\n  - admin-tokens: {{ token: {{ env: BUSBAR_ADMIN_TOKEN }} }}\n\
+         auth:\n  chain: []\n  signing_key: {{ env: BUSBAR_SIGNING_KEY }}\n  admin_auth:\n  - admin-tokens: {{ token: {{ env: BUSBAR_ADMIN_TOKEN }} }}\n\
          providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
          models:\n  test-model:\n    provider: mock\n",
         plugins_dir.display()
@@ -333,6 +337,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
         .env("BUSBAR_CONFIG", &config1)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_ADMIN_TOKEN", admin_token)
+        .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
         .env("BUSBAR_STATE_FILE", "")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -412,6 +417,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
         .env("BUSBAR_CONFIG", &config2)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_ADMIN_TOKEN", admin_token)
+        .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
         .env("BUSBAR_STATE_FILE", "")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
