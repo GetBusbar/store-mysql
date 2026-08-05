@@ -3,8 +3,8 @@
 The MySQL/MariaDB backend for busbar's durable governance store — a `kind: store` plugin.
 
 Targets the common SQL subset supported by MySQL 8.0.16+, MariaDB, and Aurora MySQL: one plugin,
-protocol-compatible with all three, same reasoning as busbar's "Valkey (Redis-protocol compatible)"
-naming — broad coverage via standard SQL, not three separate builds.
+protocol-compatible with all three, same reasoning as busbar's Valkey store covering any server that
+speaks the standard RESP protocol — broad coverage via standard SQL, not three separate builds.
 
 Point a fleet of busbar nodes at one MySQL/MariaDB server and they share virtual keys, budgets, and
 usage across the cluster, same as the sibling `store-postgres` plugin.
