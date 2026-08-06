@@ -1372,26 +1372,60 @@ impl Store for MysqlStore {
     }
 
     fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
-
         // `ON DUPLICATE KEY UPDATE seq = seq` kept the stored record and said nothing, which is
-        // right for ONE of the two ways a seq collides and wrong for the other. Compare them under
-        // a row lock and let the difference decide (see the trait contract):
+        // right for ONE of the two ways a seq collides and wrong for the other. Compare them and
+        // let the difference decide (see the trait contract):
         //   identical -> the write-through retrying after a lost commit ACK. Common, benign, Ok.
         //   different -> two records claiming one chain position: a forked or tampered log, and the
         //                single most important thing an audit store can report.
-        // The second case used to be dropped on the floor.
-        let existing: Option<AuditRowTuple> = tx
-            .exec_first(
-                "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
-                 FROM audit_log WHERE seq = :seq FOR UPDATE",
-                params! { "seq" => entry.seq },
+        //
+        // INSERT FIRST, and deliberately with NO preceding `SELECT ... FOR UPDATE`.
+        //
+        // The obvious shape — take a row lock, look, then insert — DEADLOCKS here, and measurably:
+        // `SELECT ... FOR UPDATE` on a MISSING row takes a next-key/gap lock under REPEATABLE READ
+        // (which is what `TxOpts::default()` leaves the server on). Two appends of DIFFERENT, both
+        // new seqs land in the same gap; the gap locks are mutually compatible, but each side's
+        // following INSERT needs an insert-intention lock that conflicts with the other's gap lock.
+        // Four threads appending 200 distinct seqs each produced 39 deadlocks that way against 0
+        // for the plain autocommit insert. `append_audit` is also the one control-plane path that
+        // does not call `bump_revision`, so it sits OUTSIDE the `store_sequence` serialization that
+        // makes every other admin-plane transaction deadlock-free — it has no other protection.
+        //
+        // A bare INSERT takes only an insert-intention lock and no gap lock, so the ordinary path
+        // keeps the baseline's concurrency exactly, and the read only happens on the rare collision.
+        //
+        // The loop covers the row being deleted between the insert and the read-back: the seq is
+        // free again, so inserting is the right move. Bounded, and exhausting the bound is an error
+        // rather than a success, so no path here returns Ok without the record being stored.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut conn = self.conn()?;
+        for _ in 0..MAX_ATTEMPTS {
+            conn.exec_drop(
+                "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash) \
+                 VALUES (:seq, :ts, :action, :resource, :outcome, :principal, :prev, :hash) \
+                 ON DUPLICATE KEY UPDATE seq = seq",
+                params! {
+                    "seq" => entry.seq, "ts" => entry.ts, "action" => &entry.action,
+                    "resource" => &entry.resource, "outcome" => &entry.outcome,
+                    "principal" => &entry.principal, "prev" => &entry.prev_hash, "hash" => &entry.hash,
+                },
             )
             .map_err(store_err)?;
-        if let Some((seq, ts, action, resource, outcome, principal, prev_hash, hash)) = existing {
+            // 1 = inserted. 0 = the seq was already occupied and `seq = seq` changed nothing.
+            if conn.affected_rows() == 1 {
+                return Ok(());
+            }
+            let existing: Option<AuditRowTuple> = conn
+                .exec_first(
+                    "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
+                     FROM audit_log WHERE seq = :seq",
+                    params! { "seq" => entry.seq },
+                )
+                .map_err(store_err)?;
+            let Some((seq, ts, action, resource, outcome, principal, prev_hash, hash)) = existing
+            else {
+                continue; // gone between the insert and the read: the seq is free, try again
+            };
             let stored = AuditRecord {
                 seq,
                 ts,
@@ -1402,7 +1436,6 @@ impl Store for MysqlStore {
                 prev_hash,
                 hash,
             };
-            tx.rollback().map_err(store_err)?;
             if stored == *entry {
                 return Ok(());
             }
@@ -1412,18 +1445,12 @@ impl Store for MysqlStore {
                 entry.seq, stored.action, entry.action
             )));
         }
-
-        tx.exec_drop(
-            "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash) \
-             VALUES (:seq, :ts, :action, :resource, :outcome, :principal, :prev, :hash)",
-            params! {
-                "seq" => entry.seq, "ts" => entry.ts, "action" => &entry.action,
-                "resource" => &entry.resource, "outcome" => &entry.outcome,
-                "principal" => &entry.principal, "prev" => &entry.prev_hash, "hash" => &entry.hash,
-            },
-        )
-        .map_err(store_err)?;
-        tx.commit().map_err(store_err)
+        Err(store_err(format!(
+            "append_audit: seq {} kept being freed between the insert and the read-back after \
+             {MAX_ATTEMPTS} attempts; something is deleting audit rows concurrently and the record \
+             was NOT stored",
+            entry.seq
+        )))
     }
 
     fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {

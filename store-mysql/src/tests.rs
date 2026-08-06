@@ -1483,11 +1483,29 @@ mod conformance {
         );
     }
 
-    fn setup(check: &str, seq: u64) -> Option<(MysqlStore, String)> {
-        let url = test_url()?;
-        let store = MysqlStore::connect(&url).expect("connect");
+    /// ONE store shared by all four checks.
+    ///
+    /// `MysqlStore::connect` re-runs the schema DDL and the invariant probes on EVERY call, and this
+    /// module's checks run in parallel with sibling tests that hold `SELECT ... FOR UPDATE`
+    /// transactions open. Connecting four more times mid-suite made those siblings fail with
+    /// `ERROR 1412 (Table definition has changed, please retry transaction)` about one run in six.
+    /// Connecting once, behind a `OnceLock`, removes the extra DDL entirely; the checks stay
+    /// isolated from each other through their per-check namespaces, not through separate
+    /// connections.
+    fn shared_store() -> Option<&'static MysqlStore> {
+        static STORE: std::sync::OnceLock<Option<MysqlStore>> = std::sync::OnceLock::new();
+        STORE
+            .get_or_init(|| {
+                let url = test_url()?;
+                Some(MysqlStore::connect(&url).expect("connect"))
+            })
+            .as_ref()
+    }
+
+    fn setup(check: &str, seq: u64) -> Option<(&'static MysqlStore, String)> {
+        let store = shared_store()?;
         let ns = ns(check);
-        reset(&store, &ns, seq);
+        reset(store, &ns, seq);
         Some((store, ns))
     }
 
@@ -1496,7 +1514,7 @@ mod conformance {
         let Some((store, ns)) = setup("put", 0) else {
             return;
         };
-        conf::assert_put_key_does_not_resurrect_a_tombstone(&store, &ns);
+        conf::assert_put_key_does_not_resurrect_a_tombstone(store, &ns);
     }
 
     #[test]
@@ -1504,7 +1522,7 @@ mod conformance {
         let Some((store, ns)) = setup("del", 0) else {
             return;
         };
-        conf::assert_delete_key_unknown_id_is_an_error(&store, &ns);
+        conf::assert_delete_key_unknown_id_is_an_error(store, &ns);
     }
 
     #[test]
@@ -1512,7 +1530,7 @@ mod conformance {
         let Some((store, ns)) = setup("rev", 0) else {
             return;
         };
-        conf::assert_revoke_credential_unknown_id_is_an_error(&store, &ns);
+        conf::assert_revoke_credential_unknown_id_is_an_error(store, &ns);
     }
 
     #[test]
@@ -1521,6 +1539,80 @@ mod conformance {
         let Some((store, _ns)) = setup("aud", seq) else {
             return;
         };
-        conf::assert_append_audit_duplicate_seq(&store, seq);
+        conf::assert_append_audit_duplicate_seq(store, seq);
     }
+}
+
+/// Concurrent appends of DIFFERENT seqs must not deadlock.
+///
+/// The duplicate-seq comparison was first written as `SELECT ... FOR UPDATE` then INSERT. Under
+/// REPEATABLE READ (what `TxOpts::default()` leaves the server on) a `FOR UPDATE` on a MISSING row
+/// takes a next-key/gap lock; two appends of different, both-new seqs land in the same gap, and each
+/// side's following INSERT needs an insert-intention lock that conflicts with the other's gap lock.
+/// Four threads over 200 distinct seqs each produced 39 `ERROR 1213` deadlocks that way, against 0
+/// for the plain insert it replaced. `append_audit` is also the one control-plane path that does not
+/// call `bump_revision`, so it sits outside the `store_sequence` serialization that keeps every other
+/// admin-plane transaction deadlock-free.
+///
+/// A durable audit write-through failing under ordinary multi-node load defeats the whole point of
+/// the durable sink, so this pins it.
+#[test]
+fn concurrent_appends_of_distinct_seqs_never_deadlock() {
+    let Some(url) = test_url() else { return };
+    let base = 940_000_000u64 + (std::process::id() as u64 % 100_000) * 1_000;
+    {
+        let store = MysqlStore::connect(&url).expect("connect");
+        let mut conn = store.conn().expect("conn");
+        let _ = conn.exec_drop(
+            "DELETE FROM audit_log WHERE seq >= :lo AND seq < :hi",
+            params! { "lo" => base, "hi" => base + 1_000 },
+        );
+    }
+
+    let threads: Vec<_> = (0..4u64)
+        .map(|t| {
+            let url = url.clone();
+            std::thread::spawn(move || {
+                let store = MysqlStore::connect(&url).expect("connect");
+                for i in 0..50u64 {
+                    let seq = base + t * 100 + i;
+                    let rec = AuditRecord {
+                        seq,
+                        ts: 1_700_000_000,
+                        action: "key.mint".into(),
+                        resource: format!("key:vk_{seq}"),
+                        outcome: "applied".into(),
+                        principal: "admin".into(),
+                        prev_hash: String::new(),
+                        hash: format!("h{seq}"),
+                    };
+                    if let Err(e) = store.append_audit(&rec) {
+                        let msg = e.to_string();
+                        assert!(
+                            !msg.contains("Deadlock") && !msg.contains("1213"),
+                            "concurrent appends of DISTINCT seqs deadlocked: {msg}"
+                        );
+                        panic!("append_audit failed unexpectedly: {msg}");
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in threads {
+        h.join().expect("no append thread may fail");
+    }
+
+    let store = MysqlStore::connect(&url).expect("connect");
+    let mut conn = store.conn().expect("conn");
+    let n: Option<u64> = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM audit_log WHERE seq >= :lo AND seq < :hi",
+            params! { "lo" => base, "hi" => base + 1_000 },
+        )
+        .unwrap();
+    assert_eq!(n, Some(200), "every distinct append must be durably stored");
+    let _ = conn.exec_drop(
+        "DELETE FROM audit_log WHERE seq >= :lo AND seq < :hi",
+        params! { "lo" => base, "hi" => base + 1_000 },
+    );
 }
