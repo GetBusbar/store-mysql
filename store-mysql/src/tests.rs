@@ -498,9 +498,9 @@ fn boot_probe_rejects_a_permissive_sql_mode() {
         .unwrap();
 }
 
-/// RED without the fix: the old code treated ANY error from the probe INSERT as proof CHECK
-/// constraints are enforced (`.is_err()` on the whole `Result`, no inspection of WHICH error).
-/// Deterministic, no live DB needed -- proves the discrimination logic itself, not just that a
+/// Treating ANY error from the probe INSERT as proof CHECK constraints are enforced (`.is_err()`
+/// on the whole `Result`, with no inspection of WHICH error) would pass for the wrong reason. This
+/// is deterministic and needs no live DB: it proves the discrimination logic itself, not that a
 /// live server happens to answer one way today.
 #[test]
 fn is_check_constraint_violation_accepts_only_the_two_real_engine_codes() {
@@ -641,8 +641,8 @@ fn delete_and_put_on_the_same_key_never_deadlock_under_concurrency() {
 //   2. Call `run_v2_backfill_if_needed` directly against the real `usage_windows` table — the
 //      production UPDATE is correctly UNSCOPED (a real one-time boot migration touches the whole
 //      table, matching store-postgres/store-sqlite exactly), so calling it directly during a
-//      concurrently-running suite corrupts OTHER tests' legitimate `billable_requests=0` rows
-//      (reproduced: unrelated tests like `put_and_get_usage_roundtrips` started failing).
+//      concurrently-running suite corrupts OTHER tests' legitimate `billable_requests=0` rows,
+//      which shows up as unrelated failures in tests like `put_and_get_usage_roundtrips`.
 // Unlike store-postgres's own equivalent test (which isolates via a throwaway DATABASE per test),
 // the `busbar` CI user has no `CREATE DATABASE` privilege (confirmed: `ERROR 1044 Access denied for
 // user 'busbar'@'%'`) — only table-level DDL within the one shared database, which is what
@@ -775,7 +775,7 @@ fn migrate_v3_fixes_key_group_at_use_collation_for_a_pre_migration_table() {
     let before = scratch_collation(&mut conn, &table, "key_group_at_use");
     assert_ne!(
         before, "ascii_bin",
-        "the scratch table must start in the pre-fix state, or this test proves nothing"
+        "the scratch table must start on a non-ascii_bin collation, or this test proves nothing"
     );
 
     MysqlStore::run_v3_ascii_bin_fix_if_needed(&mut conn, 1, &table)
@@ -818,17 +818,17 @@ fn migrate_v3_does_not_touch_a_table_when_the_database_is_not_pre_v3() {
 }
 
 /// KNOWN, DOCUMENTED, NOT-YET-CLOSED GAP -- see `run_v2_backfill_if_needed`'s own doc comment for
-/// the full writeup and why a `GET_LOCK`-based fix (designed, then rejected in adversarial design
-/// review) doesn't actually close this. Characterizes the exact rolling-upgrade race as a
+/// the full writeup, including why a `GET_LOCK` does not close it. Characterizes the exact
+/// rolling-upgrade race as a
 /// deterministic ORDER-of-operations reproduction (no real thread timing needed -- the race is
 /// about which write reaches the row first, which a single-threaded test can fully control): a
 /// pre-v2 row that receives ONE legitimate real v2 write (simulating an already-live node
 /// elsewhere in the fleet) BEFORE this node's own backfill runs permanently loses its pre-v2
 /// history from ever being counted as billable.
 ///
-/// `#[ignore]`d: this documents real, CURRENT behavior (confirmed failing below), not a regression
-/// to catch. Un-ignore once the provenance-based redesign `run_v2_backfill_if_needed` describes
-/// lands, at which point this assertion should start passing.
+/// `#[ignore]`d: it documents real, CURRENT behavior rather than guarding a regression, so it
+/// fails today by design. Un-ignore once the provenance-based redesign
+/// `run_v2_backfill_if_needed` describes lands, at which point the assertion starts passing.
 #[test]
 #[ignore = "characterizes a known, documented, not-yet-fixed gap -- see run_v2_backfill_if_needed's doc comment"]
 fn characterize_v2_backfill_loses_a_row_to_a_racing_live_write() {
@@ -1017,11 +1017,11 @@ fn read_prior_version_parses_a_real_stored_value() {
     assert_eq!(v, 1);
 }
 
-/// RED without the fix: the old code's `.and_then(|v| v.parse().ok()).unwrap_or(0)` silently turns
-/// a corrupt, non-numeric stored value into version 0 (indistinguishable from "fresh install") --
-/// exactly the "looks already migrated but isn't" failure mode the module doc warns against, just
-/// approached from a different angle (a corrupt marker instead of a query error). A corrupt marker
-/// must hard-fail, not silently default.
+/// A `.and_then(|v| v.parse().ok()).unwrap_or(0)` read would silently turn a corrupt, non-numeric
+/// stored value into version 0, indistinguishable from "fresh install" -- the same
+/// "looks already migrated but isn't" failure mode the module doc warns about, reached via a
+/// corrupt marker instead of a query error. A corrupt marker must hard-fail, not silently
+/// default.
 #[test]
 fn read_prior_version_hard_fails_on_a_corrupt_stored_value() {
     let Some(s) = fresh_store() else { return };
@@ -1040,8 +1040,8 @@ fn read_prior_version_hard_fails_on_a_corrupt_stored_value() {
 }
 
 /// `revoke_credential` must reject an unknown/typo'd id loudly, not silently return `Ok(())`.
-/// RED without the fix: this asserts `Err`, which the old unconditional `UPDATE ... WHERE id=:id`
-/// (never checked for a match) could not produce.
+/// An unconditional `UPDATE ... WHERE id=:id` that never checks for a matched row cannot produce
+/// the `Err` this asserts.
 #[test]
 fn revoke_credential_rejects_an_unknown_id() {
     let Some(s) = fresh_store() else { return };
@@ -1055,9 +1055,8 @@ fn revoke_credential_rejects_an_unknown_id() {
 }
 
 /// `put_credential` must reject a `public_id` collision against a DIFFERENT credential's id, not
-/// silently corrupt the unrelated row via `ON DUPLICATE KEY UPDATE`. RED without the fix: the old
-/// code let this succeed, overwriting the unrelated row's `id`/`secret`/etc while leaving its
-/// `key_id`/`slot` untouched.
+/// silently corrupt the unrelated row via `ON DUPLICATE KEY UPDATE`, which would overwrite that
+/// row's `id`/`secret` and leave its `key_id`/`slot` untouched.
 #[test]
 fn put_credential_rejects_a_public_id_collision_against_a_different_credential() {
     let Some(s) = fresh_store() else { return };
@@ -1093,10 +1092,10 @@ fn put_credential_rejects_a_public_id_collision_against_a_different_credential()
 }
 
 /// `put_credential` must also reject a PRIMARY KEY (`id`) collision against a row that belongs to
-/// a DIFFERENT `key_id`/`slot` -- the third of the table's 3 unique keys, and the one the first
-/// (public_id-only) guard attempt missed. RED without the fix: `ON DUPLICATE KEY UPDATE`'s SET
-/// list never touches `key_id`/`slot`, so this would silently overwrite the existing row's secret
-/// material while leaving it attached to the WRONG key/slot.
+/// a DIFFERENT `key_id`/`slot` -- the third of the table's 3 unique keys, and the one a
+/// public_id-only guard does not cover. `ON DUPLICATE KEY UPDATE`'s SET list never touches
+/// `key_id`/`slot`, so without this guard the statement silently overwrites the existing row's
+/// secret material while leaving it attached to the WRONG key/slot.
 #[test]
 fn put_credential_rejects_an_id_collision_against_a_different_key_or_slot() {
     let Some(s) = fresh_store() else { return };

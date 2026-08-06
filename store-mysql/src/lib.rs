@@ -264,9 +264,9 @@ impl MysqlStore {
     /// Takes `prior_version` as an explicit argument rather than reading `store_meta` itself, purely
     /// so the migration tests can call this directly with a hardcoded version and never have to
     /// mutate the single GLOBAL `store_meta.schema_version` row the whole shared test-server
-    /// suite reads/writes on every `connect()` — that mutation approach was tried first and produced
-    /// a real, reproduced race (any concurrently-running test's own `connect()` unconditionally
-    /// overwrites `schema_version` back to current, racing a test's deliberately-lowered marker).
+    /// suite reads/writes on every `connect()`. Mutating that row instead races: any concurrently
+    /// running test's own `connect()` unconditionally overwrites `schema_version` back to current,
+    /// clobbering another test's deliberately-lowered marker.
     ///
     /// Also takes `table` rather than hardcoding `usage_windows`, again purely for test isolation:
     /// unlike store-postgres's own equivalent test (which runs each migration test against its own
@@ -279,9 +279,8 @@ impl MysqlStore {
     /// private scratch table instead of racing every other concurrently-running test's legitimate
     /// writes to the real, shared `usage_windows`.
     ///
-    /// KNOWN, DOCUMENTED, NOT-YET-CLOSED GAP (found in `/codeaudit`, confirmed by two independent
-    /// adversarial design reviews — do not "fix" this with a lock; both reviews independently showed
-    /// a lock here is the wrong tool, see below): this UPDATE is UNSCOPED and assumes "a one-time
+    /// KNOWN, DOCUMENTED, NOT-YET-CLOSED GAP — and a lock is NOT the fix for it (see below): this
+    /// UPDATE is UNSCOPED and assumes "a one-time
     /// boot migration runs before any concurrent traffic exists" — true for a full-fleet restart, but
     /// this store's own target topology is a ROLLING upgrade (README: multiple busbar nodes sharing
     /// one MySQL server). In a rolling upgrade, some nodes are ALREADY LIVE on v2 — genuinely writing
@@ -290,13 +289,13 @@ impl MysqlStore {
     /// predicate (`billable_requests = 0 AND requests > 0`) no longer matches it, and that row's
     /// PRE-v2 historical `requests` are PERMANENTLY never reclassified as billable — a silent,
     /// unrepairable billing undercount, i.e. exactly the `hydrate_budgets` bug class this migration
-    /// exists to close, reintroduced by a race in the migration itself. A `GET_LOCK`-based fix was
-    /// designed and rejected in review: it can only serialize NODES STILL BOOTING against each
-    /// other (the backfill's own re-run is already idempotent, so that case was never actually
-    /// unsafe) — it does nothing for a node that is ALREADY LIVE and never touches this function at
-    /// all, which is the actual race. Closing this for real needs pre-v2 rows to be identifiable by
-    /// something live traffic cannot change (a captured `window_start`/time cutoff, or a per-row
-    /// provenance marker) — real redesign work, out of scope for this pass. OPERATIONAL MITIGATION
+    /// exists to close, reintroduced by a race in the migration itself. A `GET_LOCK` does not close
+    /// it: a lock can only serialize NODES STILL BOOTING against each other, and the backfill's own
+    /// re-run is already idempotent, so that case was never unsafe in the first place. It does
+    /// nothing about a node that is ALREADY LIVE and never enters this function at all, which is the
+    /// actual race. Closing this for real needs pre-v2 rows to be identifiable by something live
+    /// traffic cannot change (a captured `window_start`/time cutoff, or a per-row provenance
+    /// marker), which is a schema redesign rather than a lock. OPERATIONAL MITIGATION
     /// until that redesign lands: either pause the whole fleet briefly for a v1->v2 upgrade
     /// specifically (not required for any OTHER version bump), or re-run this same predicate as a
     /// manual reconciliation query after a rolling upgrade completes — safe to do since the
@@ -330,9 +329,9 @@ impl MysqlStore {
     /// v3: `usage_metering.key_group_at_use` shipped in v1.0.0 without `ascii_bin` (inherited
     /// MySQL's default case-INSENSITIVE collation) -- a real gap against this crate's own stated
     /// invariant that every opaque identifier/group-name column gets byte-exact comparison. The
-    /// `CREATE TABLE IF NOT EXISTS` fix to the schema (above) only affects a FRESH database; any
-    /// database that already ran `try_init_schema` before this fix shipped has the table already
-    /// created with the wrong collation, so a real `ALTER TABLE` is required to close it on upgrade.
+    /// The `CREATE TABLE IF NOT EXISTS` declaration above only affects a FRESH database; any
+    /// database created by a pre-v3 release already has the table at the wrong collation, so a real
+    /// `ALTER TABLE` is required to close it on upgrade.
     /// Idempotent: MODIFY COLUMN to the same collation it's already at is a harmless no-op on a
     /// database created fresh (already ascii_bin) or one already migrated past v3.
     ///
