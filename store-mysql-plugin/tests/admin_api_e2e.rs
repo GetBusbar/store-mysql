@@ -35,13 +35,54 @@ use std::time::{Duration, Instant};
 /// explicit signing key to mint virtual keys; busbar no longer auto-generates one.
 const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-struct ChildGuard(Child);
+struct ChildGuard(Child, PathBuf);
+
+impl ChildGuard {
+    /// The child's captured output, formatted for a panic message. Never panics itself: this runs
+    /// on the failure path, where a second unrelated panic would bury the first.
+    fn output(&self) -> String {
+        match std::fs::read_to_string(&self.1) {
+            Ok(s) if s.trim().is_empty() => "  (the child produced no output)".to_string(),
+            Ok(s) => s
+                .lines()
+                .map(|l| format!("  | {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(e) => format!("  (could not read {}: {e})", self.1.display()),
+        }
+    }
+}
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// Spawn `busbar` with stdout+stderr captured to `log`, wrapped in a guard that knows where to find
+/// them. Every boot goes through here so the capture cannot be forgotten on one added later.
+///
+/// A FILE, not `Stdio::piped()`: nothing reads the pipe while the child runs, so a child that
+/// out-talked the pipe buffer would block forever on write and turn a clean failure into a hang.
+///
+/// This is not bookkeeping. Both boots ran with their output sent to /dev/null, so a failed boot
+/// could report only an exit code: the qa-gate's store-mysql leg failed with exactly
+/// "boot #1 exited before its admin listener came up (status: exit status: 1)" and nothing else,
+/// which is not enough to act on. The sibling store-postgres harness already carries this fix and
+/// documents having lost a gate leg to the same blindness.
+fn spawn_busbar(cmd: &mut Command, log: PathBuf, what: &str) -> ChildGuard {
+    let out = std::fs::File::create(&log)
+        .unwrap_or_else(|e| panic!("create the {what} log at {}: {e}", log.display()));
+    let err = out
+        .try_clone()
+        .unwrap_or_else(|e| panic!("dup the {what} log handle: {e}"));
+    let child = cmd
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn the real busbar for {what}: {e}"));
+    ChildGuard(child, log)
 }
 
 /// Cleans up the REAL minted row (by its real random id) on drop -- including on panic-unwind, since
@@ -237,11 +278,16 @@ fn wait_for_admin_listener(
             return;
         }
         if let Ok(Some(status)) = guard.0.try_wait() {
-            panic!("{what} exited before its admin listener came up (status: {status})");
+            panic!(
+                "{what} exited before its admin listener came up (status: {status})\n\
+                 --- {what} output ---\n{}",
+                guard.output()
+            );
         }
         assert!(
             Instant::now() < deadline,
-            "{what}'s admin listener never came up within 15s"
+            "{what}'s admin listener never came up within 15s\n--- {what} output ---\n{}",
+            guard.output()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -334,17 +380,16 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
     let config1 = work.join("config1.yaml");
     std::fs::write(&config1, &providers_and_common).unwrap();
 
-    let child1 = Command::new(&busbar_bin)
-        .env("BUSBAR_CONFIG", &config1)
-        .env("BUSBAR_PROVIDERS", &providers)
-        .env("BUSBAR_ADMIN_TOKEN", admin_token)
-        .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
-        .env("BUSBAR_STATE_FILE", "")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the real busbar boot (memory store, admin listener up)");
-    let mut guard1 = ChildGuard(child1);
+    let mut guard1 = spawn_busbar(
+        Command::new(&busbar_bin)
+            .env("BUSBAR_CONFIG", &config1)
+            .env("BUSBAR_PROVIDERS", &providers)
+            .env("BUSBAR_ADMIN_TOKEN", admin_token)
+            .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
+            .env("BUSBAR_STATE_FILE", ""),
+        work.join("boot1.log"),
+        "boot #1 (memory store, admin listener up)",
+    );
     wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard1, "boot #1");
 
     // REAL ADMIN-API INSTALL.
@@ -414,17 +459,16 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
     )
     .unwrap();
 
-    let child2 = Command::new(&busbar_bin)
-        .env("BUSBAR_CONFIG", &config2)
-        .env("BUSBAR_PROVIDERS", &providers)
-        .env("BUSBAR_ADMIN_TOKEN", admin_token)
-        .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
-        .env("BUSBAR_STATE_FILE", "")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the real busbar boot (mysql store, the admin-installed plugin)");
-    let mut guard2 = ChildGuard(child2);
+    let mut guard2 = spawn_busbar(
+        Command::new(&busbar_bin)
+            .env("BUSBAR_CONFIG", &config2)
+            .env("BUSBAR_PROVIDERS", &providers)
+            .env("BUSBAR_ADMIN_TOKEN", admin_token)
+            .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
+            .env("BUSBAR_STATE_FILE", ""),
+        work.join("boot2.log"),
+        "boot #2 (mysql store, the admin-installed plugin)",
+    );
 
     // Poll -- via a RAW independent mysql::Pool, never MysqlStore::connect -- for `api_keys` to
     // appear, the only genuine confirmation boot #2 dlopened the admin-installed plugin and ran
