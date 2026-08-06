@@ -8,7 +8,7 @@ requests, or discussions.**
 Instead, report privately through either channel:
 
 - Email **security@getbusbar.com**, or
-- GitHub's [private vulnerability reporting](https://github.com/GetBusbar/store-postgres/security/advisories/new)
+- GitHub's [private vulnerability reporting](https://github.com/GetBusbar/store-mysql/security/advisories/new)
   (the **Security** tab on this repository).
 
 Please include:
@@ -20,14 +20,14 @@ Please include:
 
 We aim to **acknowledge your report within 48 hours**, work with you on a fix, and
 coordinate disclosure timing. Confirmed vulnerabilities are published as
-[GitHub Security Advisories](https://github.com/GetBusbar/store-postgres/security/advisories),
+[GitHub Security Advisories](https://github.com/GetBusbar/store-mysql/security/advisories),
 through which we request and issue **CVE** identifiers. We credit reporters who wish to be
 credited once a fix is released.
 
 ## Scope
 
-`store-postgres` is a `kind: store` busbar plugin: it persists busbar's governance
-data — virtual keys, budgets, and usage — in a shared Postgres database behind a
+`store-mysql` is a `kind: store` busbar plugin: it persists busbar's governance
+data — virtual keys, budgets, and usage — in a shared MySQL/MariaDB database behind a
 fleet of busbar nodes. Issues of particular interest include:
 
 - SQL injection or any path where request-derived data reaches a query
