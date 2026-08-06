@@ -32,6 +32,25 @@ fn fresh_store() -> Option<MysqlStore> {
     let url = test_url()?;
     let store = MysqlStore::connect(&url).expect("connect+schema");
 
+    ensure_reset(&store);
+    Some(store)
+}
+
+/// The one-time table wipe, as its own barrier so a test can join it WITHOUT paying for another
+/// `MysqlStore::connect`.
+///
+/// It TRUNCATEs `audit_log`, `api_keys`, `usage_windows` and friends, and `Once` fires it at whatever
+/// moment the FIRST caller arrives. Under parallel tests that moment can land in the middle of
+/// another test's run — so a test that writes rows without having joined this barrier can have them
+/// wiped underneath it. That is exactly what happened: tests reaching the store through
+/// `MysqlStore::connect` directly never participated, and lost rows mid-run
+/// (`concurrent_appends_of_distinct_seqs_never_deadlock` 10/16, plus `add_usage_...` and a
+/// conformance check).
+///
+/// `Once::call_once` also BLOCKS concurrent callers until the wipe completes, which is the property
+/// that makes joining it sufficient: every participant either does the truncate or waits for it, and
+/// none of them has written anything yet.
+fn ensure_reset(store: &MysqlStore) {
     static RESET_ONCE: std::sync::Once = std::sync::Once::new();
     RESET_ONCE.call_once(|| {
         let mut conn = store.pool.get_conn().unwrap();
@@ -50,8 +69,6 @@ fn fresh_store() -> Option<MysqlStore> {
         conn.query_drop("UPDATE store_sequence SET revision = 0 WHERE id = 1")
             .unwrap();
     });
-
-    Some(store)
 }
 
 /// `purge_windows_before` is UNSCOPED by contract: it deletes every window below the cutoff, across
@@ -580,6 +597,10 @@ fn get_usage_on_an_empty_window_returns_zeroes_not_a_panic() {
 
 #[test]
 fn add_usage_accumulates_and_floors_at_zero() {
+    // Reads a usage window back, so it has to be serialised against the UNSCOPED
+    // `purge_windows_before` like the other window-reading tests. It was missed when that lock was
+    // introduced, which left it losing its rows to a concurrent purge about 1 run in 18.
+    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let delta = UsageDelta {
         requests: 3,
@@ -1497,7 +1518,11 @@ mod conformance {
         STORE
             .get_or_init(|| {
                 let url = test_url()?;
-                Some(MysqlStore::connect(&url).expect("connect"))
+                let s = MysqlStore::connect(&url).expect("connect");
+                // Same barrier as every other test: without it the one-time TRUNCATE can land in
+                // the middle of a conformance check and delete the rows it just wrote.
+                super::ensure_reset(&s);
+                Some(s)
             })
             .as_ref()
     }
@@ -1558,10 +1583,22 @@ mod conformance {
 /// the durable sink, so this pins it.
 #[test]
 fn concurrent_appends_of_distinct_seqs_never_deadlock() {
+    // ONE store, shared by every thread, instead of one `connect()` per worker.
+    //
+    // `MysqlStore::connect` re-runs the whole schema DDL on every call (`init_schema`), and doing
+    // that mid-suite makes sibling tests holding `SELECT ... FOR UPDATE` fail with
+    // `ERROR 1412 (Table definition has changed, please retry transaction)`. An earlier version of
+    // this test connected six extra times and took a suite that was 20/20 clean to 3/20 failing --
+    // while the commit adding it claimed to have REMOVED mid-suite connects. The pool inside one
+    // store is what provides the concurrency here; extra stores only bought extra DDL.
     let Some(url) = test_url() else { return };
     let base = 940_000_000u64 + (std::process::id() as u64 % 100_000) * 1_000;
+    let shared = std::sync::Arc::new(MysqlStore::connect(&url).expect("connect"));
+    // Join the one-time wipe barrier before writing anything, or it can fire mid-run and truncate
+    // `audit_log` underneath these 200 appends.
+    ensure_reset(&shared);
     {
-        let store = MysqlStore::connect(&url).expect("connect");
+        let store = std::sync::Arc::clone(&shared);
         let mut conn = store.conn().expect("conn");
         let _ = conn.exec_drop(
             "DELETE FROM audit_log WHERE seq >= :lo AND seq < :hi",
@@ -1571,9 +1608,8 @@ fn concurrent_appends_of_distinct_seqs_never_deadlock() {
 
     let threads: Vec<_> = (0..4u64)
         .map(|t| {
-            let url = url.clone();
+            let store = std::sync::Arc::clone(&shared);
             std::thread::spawn(move || {
-                let store = MysqlStore::connect(&url).expect("connect");
                 for i in 0..50u64 {
                     let seq = base + t * 100 + i;
                     let rec = AuditRecord {
@@ -1602,8 +1638,7 @@ fn concurrent_appends_of_distinct_seqs_never_deadlock() {
         h.join().expect("no append thread may fail");
     }
 
-    let store = MysqlStore::connect(&url).expect("connect");
-    let mut conn = store.conn().expect("conn");
+    let mut conn = shared.conn().expect("conn");
     let n: Option<u64> = conn
         .exec_first(
             "SELECT COUNT(*) FROM audit_log WHERE seq >= :lo AND seq < :hi",
