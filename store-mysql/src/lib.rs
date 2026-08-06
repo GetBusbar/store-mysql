@@ -667,6 +667,34 @@ impl Store for MysqlStore {
             .map_err(store_err)?;
         let rev = Self::bump_revision(&mut tx)?;
 
+        // TOMBSTONE PRECONDITION (see `Store::put_key`): a live-shaped write must not overwrite a
+        // tombstoned row, which would reissue an id the contract says is never reissued and revive
+        // every token minted before the delete.
+        //
+        // `ON DUPLICATE KEY UPDATE` takes no WHERE, so unlike the other SQL backends this cannot
+        // ride on the upsert itself. `SELECT ... FOR UPDATE` inside the transaction is equivalent
+        // here and is the idiom this file already uses for exactly this problem (`delete_key`,
+        // `revoke_credential`, `put_credential`'s slot guard): the row lock is held to commit, so
+        // the test and the write are atomic and a concurrent `delete_key` cannot land in between.
+        // Ordered AFTER `bump_revision` to keep the crate's fixed lock order, store_sequence before
+        // api_keys.
+        if key.deleted_at.is_none() {
+            let existing: Option<(Option<u64>,)> = tx
+                .exec_first(
+                    "SELECT deleted_at FROM api_keys WHERE id = :id FOR UPDATE",
+                    params! { "id" => &key.id },
+                )
+                .map_err(store_err)?;
+            if let Some((Some(_),)) = existing {
+                tx.rollback().map_err(store_err)?;
+                return Err(store_err(format!(
+                    "put_key: '{}' is tombstoned and its id is never reissued; refusing to clear \
+                     the tombstone",
+                    key.id
+                )));
+            }
+        }
+
         let pools_json = scopes_to_pools_json(&key.allowed_scopes)?;
         let labels_json = serde_json::to_string(&key.labels).map_err(store_err)?;
         let group = key.group.clone().unwrap_or_default();
@@ -764,7 +792,11 @@ impl Store for MysqlStore {
             .map_err(store_err)?;
         let Some((deleted_at,)) = existing else {
             tx.rollback().map_err(store_err)?;
-            return Ok(()); // unknown id: treated as already-gone, matching store-memory's idempotent contract
+            // NOT the same case as already-tombstoned below. "Already tombstoned" means the
+            // operator's intent is satisfied and the evidence is on disk; "no such id" means
+            // nothing was touched, and Ok(()) there tells an operator who typo'd an id that a key
+            // was revoked when none was.
+            return Err(store_err(format!("delete_key: unknown id '{id}'")));
         };
         if deleted_at.is_some() {
             tx.rollback().map_err(store_err)?;
@@ -1341,17 +1373,57 @@ impl Store for MysqlStore {
 
     fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
         let mut conn = self.conn()?;
-        conn.exec_drop(
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(store_err)?;
+
+        // `ON DUPLICATE KEY UPDATE seq = seq` kept the stored record and said nothing, which is
+        // right for ONE of the two ways a seq collides and wrong for the other. Compare them under
+        // a row lock and let the difference decide (see the trait contract):
+        //   identical -> the write-through retrying after a lost commit ACK. Common, benign, Ok.
+        //   different -> two records claiming one chain position: a forked or tampered log, and the
+        //                single most important thing an audit store can report.
+        // The second case used to be dropped on the floor.
+        let existing: Option<AuditRowTuple> = tx
+            .exec_first(
+                "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
+                 FROM audit_log WHERE seq = :seq FOR UPDATE",
+                params! { "seq" => entry.seq },
+            )
+            .map_err(store_err)?;
+        if let Some((seq, ts, action, resource, outcome, principal, prev_hash, hash)) = existing {
+            let stored = AuditRecord {
+                seq,
+                ts,
+                action,
+                resource,
+                outcome,
+                principal,
+                prev_hash,
+                hash,
+            };
+            tx.rollback().map_err(store_err)?;
+            if stored == *entry {
+                return Ok(());
+            }
+            return Err(store_err(format!(
+                "append_audit: seq {} already holds a DIFFERENT record; the audit chain has forked \
+                 (stored action '{}', incoming '{}')",
+                entry.seq, stored.action, entry.action
+            )));
+        }
+
+        tx.exec_drop(
             "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash) \
-             VALUES (:seq, :ts, :action, :resource, :outcome, :principal, :prev, :hash) \
-             ON DUPLICATE KEY UPDATE seq = seq", // idempotent re-insert on replay of the same seq
+             VALUES (:seq, :ts, :action, :resource, :outcome, :principal, :prev, :hash)",
             params! {
                 "seq" => entry.seq, "ts" => entry.ts, "action" => &entry.action,
                 "resource" => &entry.resource, "outcome" => &entry.outcome,
                 "principal" => &entry.principal, "prev" => &entry.prev_hash, "hash" => &entry.hash,
             },
         )
-        .map_err(store_err)
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)
     }
 
     fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {

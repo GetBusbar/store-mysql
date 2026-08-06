@@ -794,27 +794,68 @@ fn connect_establishes_strict_sql_mode_via_init_even_when_the_default_would_be_p
 /// loop of `delete_key`+re-`put_key` (to keep the key alive for the next iteration) on the SAME row
 /// from concurrent threads: if the two lock acquisitions ever ran in opposite order, MySQL's deadlock
 /// detector would abort one side with a real "Deadlock found" error under this contention.
+///
+/// The deleter used to keep the row alive by re-`put_key`ing a LIVE key straight over the tombstone
+/// it had just written. That is the resurrection `Store::put_key` now refuses, so the loop clears the
+/// tombstone with a raw hard DELETE instead — test scaffolding, not a store operation, and
+/// deliberately not `delete_key`, whose lock ordering is the thing under test and must keep running
+/// against a real live row every iteration.
+///
+/// The putter now tolerates the tombstone refusal, because it races: whether its live write lands or
+/// is refused depends on which side holds the row, and both outcomes are correct. What it does NOT
+/// tolerate is a deadlock, which is the entire point of the test, so the error is matched rather than
+/// swallowed. Unwrapping unconditionally would have made a lock-order regression indistinguishable
+/// from an ordinary lost race.
 #[test]
 fn delete_and_put_on_the_same_key_never_deadlock_under_concurrency() {
     let Some(s) = fresh_store() else { return };
     let id = "vk_lock_order_race";
+    let _ = s.delete_key(id);
+    {
+        let mut c = s.conn().expect("conn");
+        let _ = c.exec_drop(
+            "DELETE FROM api_keys WHERE id = :id",
+            params! { "id" => id },
+        );
+    }
     s.put_key(&sample_key(id, "g0")).unwrap();
 
     let put_store = MysqlStore::connect(&test_url().unwrap()).unwrap();
     let del_store = MysqlStore::connect(&test_url().unwrap()).unwrap();
+    let raw_url = test_url().unwrap();
 
     let putter = std::thread::spawn(move || {
         for i in 0..150 {
-            put_store
-                .put_key(&sample_key(id, &format!("g{i}")))
-                .unwrap();
+            if let Err(e) = put_store.put_key(&sample_key(id, &format!("g{i}"))) {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("is tombstoned"),
+                    "the only acceptable loss of this race is the tombstone refusal; a deadlock \
+                     means the fixed lock order broke: {msg}"
+                );
+            }
         }
     });
     let deleter = std::thread::spawn(move || {
+        let clear = MysqlStore::connect(&raw_url).unwrap();
         for _ in 0..150 {
-            // delete then immediately resurrect so the putter always has a live row to race against.
-            del_store.delete_key(id).unwrap();
-            del_store.put_key(&sample_key(id, "g_resurrect")).unwrap();
+            // `delete_key` is what this test exists to exercise: it must take store_sequence before
+            // the api_keys row, every iteration, against a genuinely live row.
+            if let Err(e) = del_store.delete_key(id) {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unknown id"),
+                    "delete_key must only ever lose this race by finding the row already cleared: \
+                     {msg}"
+                );
+            }
+            // Scaffolding: drop the tombstone so the next iteration races a live row again.
+            let mut c = clear.conn().expect("conn");
+            let _ = c.exec_drop(
+                "DELETE FROM api_keys WHERE id = :id",
+                params! { "id" => id },
+            );
+            let _ = del_store.put_key(&sample_key(id, "g_relive"));
         }
     });
 
@@ -1397,4 +1438,89 @@ fn tombstone_and_credential_destruction_are_never_observed_apart() {
         "observed tombstoned={tombstoned} cred_count={cred_count} -- a window where one half of \
          delete_key committed without the other means it is NOT one atomic transaction"
     );
+}
+
+/// The shared `Store` contract conformance suite (`busbar-plugin-testkit`) — the four behaviours the
+/// fleet used to settle differently per backend. Kept in the testkit rather than written out here so
+/// a future ruling reaches every backend at once instead of being hand-copied and drifting again.
+///
+/// Fixtures are namespaced per process AND per check, and hard-reset first. Per-process because this
+/// suite runs against a SHARED live database that is not reset between tests and CI can point more
+/// than one binary at it; per-check because these run in parallel and `reset` clears every id in the
+/// namespace it is given, so one shared namespace would have each check deleting the others' rows
+/// mid-run.
+mod conformance {
+    use super::{test_url, MysqlStore};
+    use busbar_plugin_testkit::store_conformance as conf;
+    use mysql::params;
+    use mysql::prelude::Queryable;
+
+    fn ns(check: &str) -> String {
+        format!("vk_c{}{}", std::process::id(), check)
+    }
+
+    fn reset(store: &MysqlStore, ns: &str, seq: u64) {
+        let mut conn = store.conn().expect("conn");
+        for id in conf::key_ids(ns) {
+            let _ = conn.exec_drop(
+                "DELETE FROM credentials WHERE key_id = :id",
+                params! { "id" => &id },
+            );
+            let _ = conn.exec_drop(
+                "DELETE FROM api_keys WHERE id = :id",
+                params! { "id" => &id },
+            );
+        }
+        for id in conf::credential_ids(ns) {
+            let _ = conn.exec_drop(
+                "DELETE FROM credentials WHERE id = :id",
+                params! { "id" => &id },
+            );
+        }
+        let _ = conn.exec_drop(
+            "DELETE FROM audit_log WHERE seq = :seq",
+            params! { "seq" => seq },
+        );
+    }
+
+    fn setup(check: &str, seq: u64) -> Option<(MysqlStore, String)> {
+        let url = test_url()?;
+        let store = MysqlStore::connect(&url).expect("connect");
+        let ns = ns(check);
+        reset(&store, &ns, seq);
+        Some((store, ns))
+    }
+
+    #[test]
+    fn put_key_does_not_resurrect_a_tombstone() {
+        let Some((store, ns)) = setup("put", 0) else {
+            return;
+        };
+        conf::assert_put_key_does_not_resurrect_a_tombstone(&store, &ns);
+    }
+
+    #[test]
+    fn delete_key_unknown_id_is_an_error() {
+        let Some((store, ns)) = setup("del", 0) else {
+            return;
+        };
+        conf::assert_delete_key_unknown_id_is_an_error(&store, &ns);
+    }
+
+    #[test]
+    fn revoke_credential_unknown_id_is_an_error() {
+        let Some((store, ns)) = setup("rev", 0) else {
+            return;
+        };
+        conf::assert_revoke_credential_unknown_id_is_an_error(&store, &ns);
+    }
+
+    #[test]
+    fn append_audit_duplicate_seq_is_ok_when_identical_and_an_error_when_different() {
+        let seq = 910_000_000u64 + (std::process::id() as u64 % 1_000_000);
+        let Some((store, _ns)) = setup("aud", seq) else {
+            return;
+        };
+        conf::assert_append_audit_duplicate_seq(&store, seq);
+    }
 }
