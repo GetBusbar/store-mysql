@@ -39,8 +39,8 @@ use mysql::{params, Opts, Pool, PooledConn, TxOpts};
 
 use busbar_api::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    ScopeRef, SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger,
-    VirtualKey,
+    ModelTokensDelta, ScopeRef, SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta,
+    UsageLedger, VirtualKey,
 };
 
 type MeteringRowTuple = (
@@ -833,7 +833,7 @@ impl Store for MysqlStore {
         let rows: Vec<(String, u64, u64, u64, u64)> = conn
             .exec(
                 "SELECT model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write \
-                 FROM usage_windows WHERE bucket_id = :b AND window_start = :w",
+                 FROM usage_windows WHERE bucket_id = :b AND window_start = :w AND model <> ''",
                 params! { "b" => bucket_id, "w" => window_start },
             )
             .map_err(store_err)?;
@@ -886,20 +886,51 @@ impl Store for MysqlStore {
         let mut tx = conn
             .start_transaction(TxOpts::default())
             .map_err(store_err)?;
+        // `bucket_scope` is named EXPLICITLY even though this path only ever writes 'key'. The
+        // primary key is (window_start, bucket_scope, bucket_id, model), so a predicate that skips
+        // `bucket_scope` cannot use the key beyond its first column: InnoDB then takes a next-key
+        // lock running to the index supremum, and two DELETEs for DIFFERENT windows both end up
+        // holding the gap at the end of the index and then both try to insert into it. That is a
+        // genuine deadlock between unrelated writers, and it is what MySQL's own deadlock record
+        // showed. Naming the scope lets the range close on (window_start, 'key', bucket_id, ...).
         tx.exec_drop(
-            "DELETE FROM usage_windows WHERE bucket_id = :b AND window_start = :w",
+            "DELETE FROM usage_windows \
+             WHERE window_start = :w AND bucket_scope = 'key' AND bucket_id = :b",
             params! { "b" => bucket_id, "w" => window_start },
         )
         .map_err(store_err)?;
-        for m in &ledger.models {
+        // The request counters belong to the WINDOW, not to any one model, so they live on a single
+        // reserved `model = ''` sentinel row and the per-model rows carry tokens only. Written onto
+        // every per-model row instead, `get_usage`'s `SUM(requests)` returned the count multiplied by
+        // the number of models, and a ledger with no model breakdown wrote nothing at all and
+        // discarded its counters. store-sqlite uses the same sentinel for the same reason.
+        tx.exec_drop(
+            "INSERT INTO usage_windows
+                (window_start, bucket_scope, bucket_id, model, requests, billable_requests)
+             VALUES (:w, 'key', :b, '', :req, :breq)
+             ON DUPLICATE KEY UPDATE
+                requests = VALUES(requests), billable_requests = VALUES(billable_requests)",
+            params! {
+                "w" => window_start, "b" => bucket_id,
+                "req" => ledger.requests, "breq" => ledger.billable_requests,
+            },
+        )
+        .map_err(store_err)?;
+        // Insert the per-model rows in a DETERMINISTIC order. The primary key orders by model name,
+        // so two transactions writing overlapping windows in caller order can acquire the same rows
+        // in opposite orders and deadlock. Sorting makes the acquisition order identical for every
+        // writer, which is the same discipline the control-plane paths get from taking the
+        // `store_sequence` row lock first.
+        let mut models: Vec<&ModelTokens> = ledger.models.iter().collect();
+        models.sort_by(|a, b| a.model.cmp(&b.model));
+        for m in models {
             tx.exec_drop(
                 "INSERT INTO usage_windows
-                    (window_start, bucket_scope, bucket_id, model, requests, billable_requests,
+                    (window_start, bucket_scope, bucket_id, model,
                      tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-                 VALUES (:w, 'key', :b, :model, :req, :breq, :ti, :to_, :cr, :cw)",
+                 VALUES (:w, 'key', :b, :model, :ti, :to_, :cr, :cw)",
                 params! {
                     "w" => window_start, "b" => bucket_id, "model" => &m.model,
-                    "req" => ledger.requests, "breq" => ledger.billable_requests,
                     "ti" => m.tokens.input, "to_" => m.tokens.output,
                     "cr" => m.tokens.cache_read, "cw" => m.tokens.cache_write,
                 },
@@ -920,7 +951,29 @@ impl Store for MysqlStore {
         // last-writer-wins on MySQL; the caller is trusted to flush one model at most once per
         // call here (this is the per-delta path, not a batch upsert), so this loop just applies
         // each model delta as its own upsert.
-        for m in &delta.models {
+        // The window's request counters accumulate ONCE, on the reserved `model = ''` sentinel row,
+        // not once per model. Applied inside the per-model loop instead, a single delta added its
+        // request count once for every model it carried, and a delta with no models recorded
+        // nothing. This is the fleet flush primitive, so both errors compounded permanently across
+        // every node and every flush interval.
+        tx.exec_drop(
+            "INSERT INTO usage_windows
+                (window_start, bucket_scope, bucket_id, model, requests, billable_requests)
+             VALUES (:w, 'key', :b, '', GREATEST(0, :req), GREATEST(0, :breq))
+             ON DUPLICATE KEY UPDATE
+                requests = GREATEST(0, CAST(requests AS SIGNED) + :req),
+                billable_requests = GREATEST(0, CAST(billable_requests AS SIGNED) + :breq)",
+            params! {
+                "w" => window_start, "b" => bucket_id,
+                "req" => delta.requests, "breq" => delta.billable_requests,
+            },
+        )
+        .map_err(store_err)?;
+        // Deterministic order, same reason as `put_usage`: the primary key orders by model name, so
+        // caller-order inserts from two concurrent flushes can deadlock on overlapping windows.
+        let mut models: Vec<&ModelTokensDelta> = delta.models.iter().collect();
+        models.sort_by(|a, b| a.model.cmp(&b.model));
+        for m in models {
             // The VALUES(...) row constructor is type-checked against the target UNSIGNED columns
             // even on rows where ON DUPLICATE KEY UPDATE will fire instead of the INSERT -- MySQL
             // validates the whole statement's row shape up front. A refund delta's negative i64
@@ -931,20 +984,17 @@ impl Store for MysqlStore {
             // accumulation happens.
             tx.exec_drop(
                 "INSERT INTO usage_windows
-                    (window_start, bucket_scope, bucket_id, model, requests, billable_requests,
+                    (window_start, bucket_scope, bucket_id, model,
                      tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-                 VALUES (:w, 'key', :b, :model, GREATEST(0, :req), GREATEST(0, :breq),
+                 VALUES (:w, 'key', :b, :model,
                          GREATEST(0, :ti), GREATEST(0, :to_), GREATEST(0, :cr), GREATEST(0, :cw))
                  ON DUPLICATE KEY UPDATE
-                    requests = GREATEST(0, CAST(requests AS SIGNED) + :req),
-                    billable_requests = GREATEST(0, CAST(billable_requests AS SIGNED) + :breq),
                     tokens_input = GREATEST(0, CAST(tokens_input AS SIGNED) + :ti),
                     tokens_output = GREATEST(0, CAST(tokens_output AS SIGNED) + :to_),
                     tokens_cache_read = GREATEST(0, CAST(tokens_cache_read AS SIGNED) + :cr),
                     tokens_cache_write = GREATEST(0, CAST(tokens_cache_write AS SIGNED) + :cw)",
                 params! {
                     "w" => window_start, "b" => bucket_id, "model" => &m.model,
-                    "req" => delta.requests, "breq" => delta.billable_requests,
                     "ti" => m.tokens.input, "to_" => m.tokens.output,
                     "cr" => m.tokens.cache_read, "cw" => m.tokens.cache_write,
                 },
@@ -1024,20 +1074,43 @@ impl Store for MysqlStore {
     }
 
     fn purge_windows_before(&self, before: u64) -> StoreResult<u64> {
+        // Batched AND LOOPED. The batch bound keeps any single DELETE's lock footprint and undo log
+        // small, which is why it is here; without the loop it also silently capped the purge at one
+        // batch, so a retention backlog larger than the cap was never swept and each tick returned a
+        // nonzero count that looked like progress. The contract is "purge every window below the
+        // cutoff", and the returned figure is the total actually deleted.
+        const BATCH: u64 = 5000;
         let mut conn = self.conn()?;
-        conn.exec_drop(
-            "DELETE FROM usage_windows WHERE window_start < :b LIMIT 5000",
-            params! { "b" => before },
-        )
-        .map_err(store_err)?;
-        Ok(conn.affected_rows())
+        let mut total = 0u64;
+        loop {
+            conn.exec_drop(
+                "DELETE FROM usage_windows WHERE window_start < :b LIMIT 5000",
+                params! { "b" => before },
+            )
+            .map_err(store_err)?;
+            let n = conn.affected_rows();
+            total += n;
+            if n < BATCH {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     fn purge_metering_before(&self, bucket: &str) -> StoreResult<u64> {
+        // The `bucket` column is CHAR(10) and BOTH the write path (`add_metering`) and the read path
+        // (`list_metering`) zero-pad into it. Only this method compared the caller's string as given,
+        // so the obvious caller (a u64 bucket rendered the obvious way) matched zero of its own rows
+        // and got a successful purge of nothing. Pad the same way when the input is numeric; a
+        // non-numeric value is passed through unchanged so an already-padded caller still works.
+        let padded = match bucket.trim().parse::<u64>() {
+            Ok(n) => format!("{n:010}"),
+            Err(_) => bucket.to_string(),
+        };
         let mut conn = self.conn()?;
         conn.exec_drop(
             "DELETE FROM usage_metering WHERE bucket = :b",
-            params! { "b" => bucket },
+            params! { "b" => &padded },
         )
         .map_err(store_err)?;
         Ok(conn.affected_rows())

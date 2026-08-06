@@ -54,6 +54,18 @@ fn fresh_store() -> Option<MysqlStore> {
     Some(store)
 }
 
+/// `purge_windows_before` is UNSCOPED by contract: it deletes every window below the cutoff, across
+/// every bucket. That is correct for a retention sweep and incompatible with this suite's usual
+/// isolation-by-unique-id, so the purge test and the tests that read a window back must not run at
+/// the same time. They cannot be isolated by a throwaway database either: the CI user has no
+/// CREATE DATABASE privilege (see the note above the backfill tests). One shared lock, held only by
+/// the handful of tests that care, keeps the rest of the suite parallel.
+static USAGE_WINDOWS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_usage_windows() -> std::sync::MutexGuard<'static, ()> {
+    USAGE_WINDOWS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn sample_key(id: &str, generation: &str) -> VirtualKey {
     VirtualKey {
         id: id.to_string(),
@@ -344,6 +356,7 @@ fn public_id_lookup_is_case_sensitive() {
 
 #[test]
 fn put_and_get_usage_roundtrips() {
+    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let ledger = UsageLedger {
         requests: 5,
@@ -363,6 +376,192 @@ fn put_and_get_usage_roundtrips() {
     assert_eq!(back.requests, 5);
     assert_eq!(back.billable_requests, 4);
     assert_eq!(back.models[0].tokens.input, 100);
+}
+
+/// The request counters are per-WINDOW, not per-model, and must round-trip as themselves whatever
+/// the model breakdown looks like.
+///
+/// The existing round-trip test uses exactly one model, which is the one arity where a per-model
+/// duplication is invisible: `SUM` over a single row returns the value unchanged. With N models,
+/// writing the whole `ledger.requests` onto each row and summing them back returns N times the real
+/// count, and budget hydration reads the window as N times its real usage.
+#[test]
+fn usage_request_counters_do_not_multiply_with_the_model_count() {
+    let _guard = lock_usage_windows();
+    let Some(s) = fresh_store() else { return };
+    let model = |name: &str| ModelTokens {
+        model: name.to_string(),
+        tokens: TierTokens {
+            input: 10,
+            output: 5,
+            cache_read: 0,
+            cache_write: 0,
+        },
+    };
+    let ledger = UsageLedger {
+        requests: 7,
+        billable_requests: 3,
+        models: vec![model("gpt-x"), model("gpt-y"), model("gpt-z")],
+    };
+    s.put_usage("vk_multimodel", 1_000_101, &ledger).unwrap();
+
+    let back = s.get_usage("vk_multimodel", 1_000_101).unwrap();
+    assert_eq!(
+        back.requests, 7,
+        "requests is a per-window counter: three models in one window is still seven requests"
+    );
+    assert_eq!(back.billable_requests, 3, "same for billable_requests");
+    assert_eq!(back.models.len(), 3, "every model must still round-trip");
+
+    // add_usage accumulates against the same window, and must add the delta ONCE, not once per
+    // model. This is the fleet flush primitive, so an N-times error here compounds permanently.
+    s.add_usage(
+        "vk_multimodel",
+        1_000_101,
+        &busbar_api::UsageDelta {
+            requests: 2,
+            billable_requests: 1,
+            models: vec![
+                busbar_api::ModelTokensDelta {
+                    model: "gpt-x".to_string(),
+                    tokens: busbar_api::TierTokensDelta {
+                        input: 1,
+                        output: 1,
+                        cache_read: 0,
+                        cache_write: 0,
+                    },
+                },
+                busbar_api::ModelTokensDelta {
+                    model: "gpt-y".to_string(),
+                    tokens: busbar_api::TierTokensDelta {
+                        input: 1,
+                        output: 1,
+                        cache_read: 0,
+                        cache_write: 0,
+                    },
+                },
+            ],
+        },
+    )
+    .unwrap();
+    let after = s.get_usage("vk_multimodel", 1_000_101).unwrap();
+    assert_eq!(
+        after.requests, 9,
+        "one delta of two requests must add two, not two per model"
+    );
+    assert_eq!(after.billable_requests, 4);
+}
+
+/// A ledger carrying request counters but NO per-model breakdown must still record those counters.
+/// The write path deletes the window first and then inserts one row per model, so an empty model
+/// list erased the window and reported success, discarding the requests with it. That shape is
+/// real: a window whose requests were all refunded to zero tokens still has a request count.
+#[test]
+fn usage_with_no_model_breakdown_still_records_its_request_counters() {
+    let _guard = lock_usage_windows();
+    let Some(s) = fresh_store() else { return };
+    let ledger = UsageLedger {
+        requests: 4,
+        billable_requests: 2,
+        models: vec![],
+    };
+    s.put_usage("vk_nomodels", 1_000_102, &ledger).unwrap();
+    let back = s.get_usage("vk_nomodels", 1_000_102).unwrap();
+    assert_eq!(
+        back.requests, 4,
+        "a ledger with no model breakdown still carries request counters, and they must persist"
+    );
+    assert_eq!(back.billable_requests, 2);
+}
+
+/// `purge_metering_before` must match the rows `add_metering` actually wrote. The bucket column is
+/// `CHAR(10)` and both the write and the read zero-pad into it; only the purge compared the caller's
+/// raw string, so a caller passing the unpadded form matched nothing and got a successful purge of
+/// zero rows. A retention sweep that reports success having deleted nothing is the shape this whole
+/// release has been chasing.
+#[test]
+fn purge_metering_before_matches_the_padding_the_write_path_uses() {
+    let Some(s) = fresh_store() else { return };
+    s.put_key(&sample_key("vk_purge_meter", "g")).unwrap();
+    let bucket = 20_260_731u64;
+    s.add_metering(&MeteringDelta {
+        key_id: "vk_purge_meter".to_string(),
+        bucket,
+        model: "m".to_string(),
+        provider: "p".to_string(),
+        tokens_input: 1,
+        tokens_output: 1,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: String::new(),
+        pricing_version: String::new(),
+    })
+    .unwrap();
+    assert!(
+        s.list_metering(bucket)
+            .unwrap()
+            .iter()
+            .any(|r| r.key_id == "vk_purge_meter"),
+        "precondition: the metering row must exist"
+    );
+
+    // The caller has a u64 bucket and renders it the obvious way. That is the form the trait's
+    // `&str` parameter invites, and it must reach the padded rows.
+    let purged = s.purge_metering_before(&bucket.to_string()).unwrap();
+    assert!(
+        purged >= 1,
+        "the purge must actually match the stored rows, got {purged} deleted"
+    );
+    assert!(
+        !s.list_metering(bucket)
+            .unwrap()
+            .iter()
+            .any(|r| r.key_id == "vk_purge_meter"),
+        "the named bucket must be gone after the purge"
+    );
+}
+
+/// `purge_windows_before` must purge EVERY window below the cutoff, not one capped batch. The
+/// contract is "purge every window whose window_start < before"; a single `LIMIT 5000` statement
+/// leaves a backlog larger than the cap permanently un-swept while returning a nonzero count each
+/// tick that looks like progress.
+#[test]
+fn purge_windows_before_sweeps_past_a_single_batch() {
+    let _guard = lock_usage_windows();
+    let Some(s) = fresh_store() else { return };
+    // Well clear of every other test's windows, and above the batch size so one capped statement
+    // cannot finish the job.
+    let base = 7_000_000u64;
+    let n = 5_200u64;
+    {
+        let mut conn = s.pool.get_conn().unwrap();
+        let mut sql = String::from(
+            "INSERT INTO usage_windows (window_start, bucket_scope, bucket_id, model, requests) VALUES ",
+        );
+        for i in 0..n {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({}, 'key', 'vk_purge_sweep', '', 1)", base + i));
+        }
+        conn.query_drop(sql).unwrap();
+    }
+
+    let purged = s.purge_windows_before(base + n).unwrap();
+    assert!(
+        purged >= n,
+        "every window below the cutoff must be purged and counted, not just one capped batch: \
+         expected at least {n}, got {purged}"
+    );
+    let left: u64 = {
+        let mut conn = s.pool.get_conn().unwrap();
+        conn.query_first("SELECT COUNT(*) FROM usage_windows WHERE bucket_id = 'vk_purge_sweep'")
+            .unwrap()
+            .unwrap_or(0)
+    };
+    assert_eq!(left, 0, "no window below the cutoff may survive the purge");
 }
 
 #[test]
