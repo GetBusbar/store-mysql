@@ -279,10 +279,9 @@ impl MysqlStore {
     /// private scratch table instead of racing every other concurrently-running test's legitimate
     /// writes to the real, shared `usage_windows`.
     ///
-    /// KNOWN, DOCUMENTED, NOT-YET-CLOSED GAP (found in `/codeaudit`, confirmed by two independent
-    /// adversarial design reviews — do not "fix" this with a lock; both reviews independently showed
-    /// a lock here is the wrong tool, see below): this UPDATE is UNSCOPED and assumes "a one-time
-    /// boot migration runs before any concurrent traffic exists" — true for a full-fleet restart, but
+    /// KNOWN, DOCUMENTED, NOT-YET-CLOSED GAP (a lock is NOT the fix here; the reason is set out
+    /// below): this UPDATE is UNSCOPED and assumes "a one-time boot migration runs before any
+    /// concurrent traffic exists" — true for a full-fleet restart, but
     /// this store's own target topology is a ROLLING upgrade (README: multiple busbar nodes sharing
     /// one MySQL server). In a rolling upgrade, some nodes are ALREADY LIVE on v2 — genuinely writing
     /// `billable_requests > 0` via real traffic — while another node is still booting and about to
@@ -296,9 +295,9 @@ impl MysqlStore {
     /// unsafe) — it does nothing for a node that is ALREADY LIVE and never touches this function at
     /// all, which is the actual race. Closing this for real needs pre-v2 rows to be identifiable by
     /// something live traffic cannot change (a captured `window_start`/time cutoff, or a per-row
-    /// provenance marker) — real redesign work, out of scope for this pass. OPERATIONAL MITIGATION
-    /// until that redesign lands: either pause the whole fleet briefly for a v1->v2 upgrade
-    /// specifically (not required for any OTHER version bump), or re-run this same predicate as a
+    /// provenance marker), which is real redesign work that has not been done. OPERATIONAL
+    /// MITIGATION until that redesign lands: either pause the whole fleet briefly for a v1->v2
+    /// upgrade specifically (not required for any OTHER version bump), or re-run this same predicate as a
     /// manual reconciliation query after a rolling upgrade completes — safe to do since the
     /// predicate is idempotent (a row already at `billable_requests > 0` never matches it again).
     /// See `characterize_v2_backfill_loses_a_row_to_a_racing_live_write` below for a reproduction.
