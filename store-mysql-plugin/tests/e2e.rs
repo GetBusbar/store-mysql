@@ -25,6 +25,8 @@
 //! bad config produce a clean Err across the ABI, never a panic"), a different question from "does a
 //! real end-user install work," matching store-postgres's rationale for the same split.
 
+mod common;
+
 use busbar_store_mysql::MysqlStore;
 use mysql::params;
 use std::path::PathBuf;
@@ -200,7 +202,9 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
     )
     .unwrap();
 
-    let out = Command::new(&busbar_bin)
+    let mut validate = Command::new(&busbar_bin);
+    common::apply_placeholder_secrets_from_files(&mut validate, &[&config, &providers]);
+    let out = validate
         .arg("--validate")
         .env("BUSBAR_CONFIG", &config)
         .env("BUSBAR_PROVIDERS", &providers)
