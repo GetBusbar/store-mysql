@@ -54,8 +54,22 @@ fn plugin_path() -> Option<PathBuf> {
         let exe = std::env::current_exe().ok()?;
         let profile_dir = exe.parent()?.parent()?;
         let name = busbar_plugin_loader::plugin_library_filename("busbar_store_mysql_plugin");
-        let candidate = profile_dir.join(&name);
-        candidate.exists().then_some(candidate)
+        // BOTH the "uplifted" `<profile>/<name>` copy and the raw `<profile>/deps/<name>` compiler
+        // output: a bare `cargo test` does not uplift the cdylib, only `cargo build` does, so
+        // checking the uplifted path alone made this test silently skip itself on a developer
+        // machine — the exact coverage it exists to provide, gone, with a green result.
+        let uplifted = profile_dir.join(&name);
+        let raw = profile_dir.join("deps").join(&name);
+        [uplifted, raw]
+            .into_iter()
+            .filter_map(|p| {
+                std::fs::metadata(&p)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(|mtime| (p, mtime))
+            })
+            .max_by_key(|(_, mtime)| *mtime)
+            .map(|(p, _)| p)
     })();
     if candidate.is_none() && std::env::var_os("CI").is_some() {
         panic!(
