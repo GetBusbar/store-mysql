@@ -38,8 +38,9 @@ use mysql::prelude::*;
 use mysql::{params, Opts, Pool, PooledConn, TxOpts};
 
 use busbar_api::{
-    AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    ModelTokensDelta, ScopeRef, SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta,
+    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, MeteringDelta, MeteringRow,
+    ModelTokens, ModelTokensDelta, ScopeRef, SecretForm, Store, StoreError, StoreResult,
+    TierTokens, UsageDelta,
     UsageLedger, VirtualKey,
 };
 
@@ -57,6 +58,9 @@ type MeteringRowTuple = (
     String,
 );
 type AuditRowTuple = (u64, u64, String, String, String, String, String, String);
+
+/// `(principal, seq, ts, prev_hash, hash, body)` as selected by `list_mcp_calls`.
+type McpCallRowTuple = (String, u64, u64, String, String, String);
 fn store_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError(e.to_string())
 }
@@ -65,7 +69,11 @@ fn store_err<E: std::fmt::Display>(e: E) -> StoreError {
 /// was AT before this boot" against this constant to decide which one-time migration steps below
 /// have already run, and `"1" < "2"` string-comparison stops being safe the moment version numbers
 /// reach two digits.
-const SCHEMA_VERSION: u32 = 3;
+/// v4: the durable MCP TOOL-CALL LOG (`mcp_calls`). PURELY ADDITIVE and needs no migration step —
+/// the table and its index are new, so their `SCHEMA` statements (run on every boot, with the
+/// duplicate-object error swallowed) are the entire migration. Nothing is dropped and no existing
+/// row is touched, which is why no `V4_*` constant joins the two below.
+const SCHEMA_VERSION: u32 = 4;
 
 /// The version each one-time migration step targets crossing INTO — named so a gate reads as "did
 /// this database predate step N" rather than a bare magic number, and so a future step can't be
@@ -181,6 +189,48 @@ const SCHEMA: &[&str] = &[
         hash CHAR(64) NOT NULL DEFAULT ''
     ) ENGINE=InnoDB",
     "CREATE INDEX idx_audit_resource_seq ON audit_log (resource, seq)",
+    // The DURABLE MCP TOOL-CALL LOG. A DIFFERENT POPULATION from audit_log, kept in its own table
+    // on purpose: audit_log is the low-rate admin MUTATION log whose engine-side working set is a
+    // bounded ring, while a tool call is data-plane traffic at request rate. Pouring one into the
+    // other means a busy afternoon of tool calls evicts every admin row from the ring, so the
+    // question of who changed a registration becomes unanswerable exactly when an incident makes
+    // somebody ask.
+    //
+    // The chain is scoped to the PRINCIPAL, which is why (principal, seq) is the primary key and
+    // not a global counter: a global chain would serialise every caller behind one append and would
+    // make one caller's evidence unverifiable without possessing every other caller's rows.
+    //
+    // SHAPE: opaque body plus only the columns a query needs. principal and ts are the index
+    // columns (scoped read, and the retention sweep's age key). The CHAIN COLUMNS -- seq,
+    // prev_hash, hash -- are REAL columns rather than being buried in the body, because the engine
+    // establishes durability by READING THE CHAIN BACK and verifying it; a digest reachable only by
+    // decoding an opaque payload forces a deserialise per verify and cannot be constrained or
+    // indexed by the database. The store NEVER computes or recomputes a digest -- it persists what
+    // it was handed and returns it verbatim.
+    //
+    // principal is VARCHAR(191), not the 255 audit_log uses for its own principal column: this one
+    // is half of a PRIMARY KEY, and 191 is the utf8mb4 length that keeps a keyed column inside the
+    // index limit on the older/utf8mb4-3072-byte configurations this store still supports (the same
+    // reason store_meta.k is 191).
+    "CREATE TABLE IF NOT EXISTS mcp_calls (
+        principal VARCHAR(191) NOT NULL,
+        seq BIGINT UNSIGNED NOT NULL,
+        ts BIGINT UNSIGNED NOT NULL,
+        prev_hash CHAR(64) NOT NULL DEFAULT '',
+        hash CHAR(64) NOT NULL DEFAULT '',
+        body TEXT NOT NULL,
+        -- Carried now, written by nothing yet, and deliberately so: adding a column to a populated
+        -- table later is a rewrite, whereas carrying it from the first migration is free. `version`
+        -- is the compare-and-swap slot an optimistic-concurrency write would test; `expires_at` is
+        -- the per-row sweep deadline. Retention today goes by `ts` (see purge_mcp_calls_before).
+        expires_at BIGINT UNSIGNED NULL,
+        version BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        PRIMARY KEY (principal, seq)
+    ) ENGINE=InnoDB",
+    // The retention sweep's access path: purge_mcp_calls_before deletes by ts across every
+    // principal. No IF NOT EXISTS -- MySQL has no such form for CREATE INDEX; a re-run's duplicate
+    // error is swallowed by try_init_schema, exactly as it is for idx_audit_resource_seq.
+    "CREATE INDEX idx_mcp_calls_ts ON mcp_calls (ts)",
 ];
 
 /// MySQL/MariaDB-backed [`Store`]. A single mutex-guarded pooled connection is used for all control-
@@ -1525,6 +1575,79 @@ impl Store for MysqlStore {
         tx.commit().map_err(store_err)
     }
 
+    fn append_mcp_call(&self, record: &McpCallRecord) -> StoreResult<()> {
+        let body = mcp_call_body(record);
+        let mut conn = self.conn()?;
+        // INSERT IGNORE makes the insert atomic against a concurrent writer. Reading the incumbent
+        // AFTERWARDS is safe without a transaction precisely because this table is never rewritten:
+        // a row that exists cannot change under us, so what we read is what collided.
+        conn.exec_drop(
+            "INSERT IGNORE INTO mcp_calls (principal, seq, ts, prev_hash, hash, body) \
+             VALUES (:principal, :seq, :ts, :prev, :hash, :body)",
+            params! {
+                "principal" => &record.principal, "seq" => record.seq, "ts" => record.ts,
+                "prev" => &record.prev_hash, "hash" => &record.hash, "body" => &body,
+            },
+        )
+        .map_err(store_err)?;
+        if conn.affected_rows() == 1 {
+            return Ok(());
+        }
+        let existing: Option<(u64, String, String, String)> = conn
+            .exec_first(
+                "SELECT ts, prev_hash, hash, body FROM mcp_calls WHERE principal = :principal AND seq = :seq",
+                params! { "principal" => &record.principal, "seq" => record.seq },
+            )
+            .map_err(store_err)?;
+        if let Some((e_ts, e_prev, e_hash, e_body)) = existing {
+            // BYTE-IDENTICAL is the at-least-once retry and is success. DIFFERENT is a forked or
+            // tampered log and is an error: overwriting would destroy exactly the case worth
+            // reporting, and this store never restates a digest it was handed.
+            if e_ts == record.ts
+                && e_prev == record.prev_hash
+                && e_hash == record.hash
+                && e_body == body
+            {
+                return Ok(());
+            }
+        }
+        // Names the sequence and nothing else — it must not echo stored (or caller) content back.
+        Err(StoreError(format!(
+            "mcp call log fork: a different record is already persisted at sequence {} for this principal",
+            record.seq
+        )))
+    }
+
+    fn list_mcp_calls(&self, principal: &str) -> StoreResult<Vec<McpCallRecord>> {
+        let mut conn = self.conn()?;
+        let rows: Vec<McpCallRowTuple> = conn
+            .exec(
+                "SELECT principal, seq, ts, prev_hash, hash, body FROM mcp_calls \
+                 WHERE principal = :principal ORDER BY seq",
+                params! { "principal" => principal },
+            )
+            .map_err(store_err)?;
+        Ok(rows.into_iter().map(row_to_mcp_call).collect())
+    }
+
+    fn list_mcp_call_principals(&self) -> StoreResult<Vec<String>> {
+        let mut conn = self.conn()?;
+        conn.query("SELECT DISTINCT principal FROM mcp_calls ORDER BY principal")
+            .map_err(store_err)
+    }
+
+    fn purge_mcp_calls_before(&self, before: u64) -> StoreResult<u64> {
+        // STRICTLY less-than, matching the contract's wording: a row exactly at the cutoff is kept.
+        // `affected_rows` reports what the DELETE actually removed, so the count is one performed.
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "DELETE FROM mcp_calls WHERE ts < :before",
+            params! { "before" => before },
+        )
+        .map_err(store_err)?;
+        Ok(conn.affected_rows())
+    }
+
     fn list_denylist(&self) -> StoreResult<Vec<String>> {
         let mut conn = self.conn()?;
         conn.query("SELECT sub FROM denylist").map_err(store_err)
@@ -1536,6 +1659,50 @@ fn crate_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// The non-indexed payload of a call record, as stored in `mcp_calls.body`. `principal`, `seq`,
+/// `ts`, `prev_hash` and `hash` are deliberately NOT duplicated here: they are real columns, and a
+/// value stored in two places is a value that can disagree with itself. `serde_json`'s object keys
+/// are ordered, so this encoding is deterministic — which is what makes the byte comparison in
+/// `append_mcp_call`'s replay check meaningful.
+fn mcp_call_body(record: &McpCallRecord) -> String {
+    serde_json::json!({
+        "server": record.server,
+        "tool": record.tool,
+        "outcome": record.outcome,
+        "reason": record.reason,
+        "tool_digest": record.tool_digest,
+        "pin_generation": record.pin_generation,
+        "request_id": record.request_id,
+    })
+    .to_string()
+}
+
+/// Rebuild a record from its columns plus its opaque body. The CHAIN comes from the columns, which
+/// is the point of their being columns: what the engine verifies is what the database holds in a
+/// field it can constrain, not a value recovered by decoding a payload.
+fn row_to_mcp_call(row: McpCallRowTuple) -> McpCallRecord {
+    let (principal, seq, ts, prev_hash, hash, body) = row;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    McpCallRecord {
+        principal,
+        seq,
+        ts,
+        prev_hash,
+        hash,
+        server: s("server"),
+        tool: s("tool"),
+        outcome: s("outcome"),
+        reason: s("reason"),
+        tool_digest: s("tool_digest"),
+        pin_generation: v
+            .get("pin_generation")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        request_id: s("request_id"),
+    }
 }
 
 #[cfg(test)]
