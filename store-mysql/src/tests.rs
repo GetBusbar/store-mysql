@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_api::{McpCallRecord, ModelTokensDelta, TierTokensDelta};
+use busbar_api::{McpCallRecord, ModelTokensDelta, TaskEventRow, TaskRow, TierTokensDelta};
 use std::collections::BTreeMap;
 
 fn test_url() -> Option<String> {
@@ -78,6 +78,21 @@ fn ensure_reset(store: &MysqlStore) {
 /// CREATE DATABASE privilege (see the note above the backfill tests). One shared lock, held only by
 /// the handful of tests that care, keeps the rest of the suite parallel.
 static USAGE_WINDOWS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The two tests that build a WHOLE schema from nothing against their own throwaway database (the
+/// v2 real-wiring test and the v4->v5 task-store migration) run ~25 DDL statements apiece. MySQL 8's
+/// data dictionary is shared ACROSS databases, so that DDL contends even though the two databases do
+/// not — and `init_schema`'s deadlock retry, which exists for exactly this, was observed exhausting
+/// all five attempts (`ERROR 1213` on `CREATE INDEX idx_api_keys_revision`) when both ran at once on
+/// a loaded machine. Serialising just these two keeps the DDL burst from overlapping without costing
+/// the rest of the suite any parallelism.
+static FRESH_DATABASE_DDL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_fresh_database_ddl() -> std::sync::MutexGuard<'static, ()> {
+    FRESH_DATABASE_DDL_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 fn lock_usage_windows() -> std::sync::MutexGuard<'static, ()> {
     USAGE_WINDOWS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -1163,6 +1178,7 @@ fn characterize_v2_backfill_loses_a_row_to_a_racing_live_write() {
 /// `plugin-ci.yml`'s own "set strict sql_mode" step, which already connects as root).
 #[test]
 fn try_init_schema_real_wiring_backfills_a_genuinely_pre_v2_database() {
+    let _ddl_guard = lock_fresh_database_ddl();
     let Some(url) = test_url() else { return };
     let db_name = format!(
         "busbar_wiring_{}_{}",
@@ -1875,4 +1891,631 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
         .append_mcp_call(&tampered)
         .expect_err("a payload that differs under an identical digest is a fork and must error");
     reset_calls(&store, &[p]);
+}
+
+// ── THE DURABLE A2A TASK STORE ────────────────────────────────────────────────────────────────
+//
+// A2A is async by design: a task spans turns, can sit interrupted waiting on a human, and can
+// outlive the process that started it. So the property under test is not "put_task returned Ok" —
+// the trait's default `put_task` returns `Ok(())` and keeps nothing, and `get_task` answers `None`
+// for everything, which is a backend that accepts every in-flight task and loses all of them on the
+// next deploy. The only honest proof is to READ THE TASK BACK THROUGH A RESTART, and against a live
+// server "a restart" means dropping the store — closing its pool entirely — and connecting a
+// genuinely new one.
+
+/// Timestamps are BANDED, for the same reason the MCP call-log tests band theirs. `purge_tasks_before`
+/// is GLOBAL by `(state, updated_at)` and cannot be scoped to a task or a principal, so against the
+/// SHARED live server a purge test's cutoff would delete every other test's terminal rows if the
+/// timestamps overlapped. Everything below the top of this band belongs to the purge tests; every
+/// other task test writes ABOVE it.
+const TASK_PURGE_BAND_TOP: u64 = 1_000_100_000;
+const TASK_LIVE_TS: u64 = 2_000_000_000;
+
+/// The two purge tests share the low band and both assert EXACT counts, so they cannot run at the
+/// same time as each other — the same unscoped-retention problem `USAGE_WINDOWS_LOCK` exists for.
+/// One lock held by the handful of tests that care keeps the rest of the suite parallel.
+static TASK_PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_task_purge() -> std::sync::MutexGuard<'static, ()> {
+    TASK_PURGE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn sample_task(task_id: &str, state: &str, updated_at: u64) -> TaskRow {
+    TaskRow {
+        task_id: task_id.to_string(),
+        context_id: format!("ctx-{task_id}"),
+        principal: "vk_a".to_string(),
+        direction: "inbound".to_string(),
+        state: state.to_string(),
+        agent_id: "planner".to_string(),
+        artifact_cursor: 7,
+        push_callback: "https://example.test/push".to_string(),
+        created_at: 100,
+        updated_at,
+    }
+}
+
+fn sample_event(task_id: &str, seq: u64, kind: &str, prev_hash: &str, hash: &str) -> TaskEventRow {
+    TaskEventRow {
+        task_id: task_id.to_string(),
+        seq,
+        // Saturating: the full-range test deliberately passes `u64::MAX` as `seq`, and a helper that
+        // panicked on its own arithmetic would hide the behaviour under test.
+        ts: seq.saturating_add(TASK_LIVE_TS),
+        kind: kind.to_string(),
+        context_id: format!("ctx-{task_id}"),
+        principal: "vk_a".to_string(),
+        agent_id: "planner".to_string(),
+        state: "working".to_string(),
+        request_id: format!("req-{seq}"),
+        prev_hash: prev_hash.to_string(),
+        hash: hash.to_string(),
+    }
+}
+
+/// The live MySQL server is SHARED across tests, so each test owns its own task ids and clears them
+/// first — the isolation-by-unique-id discipline the rest of this file uses.
+fn reset_tasks(store: &MysqlStore, task_ids: &[&str]) {
+    let mut conn = store.conn().expect("conn");
+    for id in task_ids {
+        conn.exec_drop(
+            "DELETE FROM task_events WHERE task_id = :id",
+            params! { "id" => *id },
+        )
+        .expect("clear this test's own events");
+        conn.exec_drop(
+            "DELETE FROM tasks WHERE task_id = :id",
+            params! { "id" => *id },
+        )
+        .expect("clear this test's own tasks");
+    }
+}
+
+/// THE TEST THAT MATTERS. A round-trip on one live handle cannot distinguish a backend that wrote to
+/// the server from one holding a HashMap behind the same trait, and it cannot distinguish either
+/// from the trait's accept-and-keep-nothing defaults. So this DROPS the store — closing its pool
+/// entirely — then connects a genuinely new one and reads the task back off the server.
+#[test]
+fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
+    let Some(url) = test_url() else { return };
+    let (t1, t2) = ("t_restart_1", "t_restart_2");
+    {
+        let store = MysqlStore::connect(&url).expect("connect");
+        reset_tasks(&store, &[t1, t2]);
+        store
+            .put_task(&sample_task(t1, "working", TASK_LIVE_TS + 200))
+            .unwrap();
+        // The write-through on a state transition REPLACES the row rather than appending a second
+        // one — an interrupted task waiting on a human is what a restart has to find.
+        let mut interrupted = sample_task(t1, "input-required", TASK_LIVE_TS + 300);
+        interrupted.artifact_cursor = 12;
+        store.put_task(&interrupted).unwrap();
+        store
+            .put_task(&sample_task(t2, "submitted", TASK_LIVE_TS + 210))
+            .unwrap();
+        drop(store);
+    }
+
+    // A genuinely new store and pool — nothing carried over in this process.
+    let reopened = MysqlStore::connect(&url).expect("reconnect");
+    let got = reopened.get_task(t1).unwrap().expect(
+        "an in-flight task must survive a restart; got None back after reconnecting, which is the \
+         accept-and-keep-nothing default this backend exists to replace",
+    );
+
+    // Every field a resume reads has to come back verbatim — not merely a row with the right id.
+    assert_eq!(got.state, "input-required", "the LAST state must win");
+    assert_eq!(
+        got.artifact_cursor, 12,
+        "the artifact cursor is where a resubscribe resumes; a stale one replays or loses the gap"
+    );
+    assert_eq!(
+        got.context_id,
+        format!("ctx-{t1}"),
+        "the resume key is the context id"
+    );
+    assert_eq!(got.principal, "vk_a");
+    assert_eq!(got.direction, "inbound");
+    assert_eq!(got.agent_id, "planner");
+    assert_eq!(got.push_callback, "https://example.test/push");
+    assert_eq!(got.created_at, 100);
+    assert_eq!(got.updated_at, TASK_LIVE_TS + 300);
+
+    // UPSERT, not append: two writes for one task_id leave ONE row.
+    let mine = reopened
+        .list_tasks()
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.task_id == t1 || t.task_id == t2)
+        .map(|t| t.task_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        mine.into_iter().collect::<Vec<_>>(),
+        vec![t1.to_string(), t2.to_string()],
+        "put_task upserts by task_id; a second write for the same id must replace, never append"
+    );
+
+    assert!(
+        reopened.get_task("t_nonexistent_task").unwrap().is_none(),
+        "an unknown task id reads back None, not an error"
+    );
+    reset_tasks(&reopened, &[t1, t2]);
+}
+
+/// `list_tasks` is deliberately UNFILTERED. The boot rehydrate wants the active rows, the retention
+/// sweep wants the terminal ones and the scoped listing wants one principal's; a store that
+/// pre-filtered for any one of those would break the other two. Pinned across a reconnect because
+/// the boot rehydrate is precisely the caller that only ever sees the post-restart answer.
+///
+/// Filtered to this test's OWN ids on the way out, not asserted as the whole table: the live server
+/// is shared and `list_tasks` is genuinely global, so an exact-set assertion here would be an
+/// assertion about what every other concurrently-running test happens to have written.
+#[test]
+fn list_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
+    let Some(url) = test_url() else { return };
+    let ids = [
+        "t_list_active",
+        "t_list_waiting",
+        "t_list_done",
+        "t_list_failed",
+    ];
+    {
+        let store = MysqlStore::connect(&url).expect("connect");
+        reset_tasks(&store, &ids);
+        store
+            .put_task(&sample_task(ids[0], "working", TASK_LIVE_TS + 200))
+            .unwrap();
+        store
+            .put_task(&sample_task(ids[1], "input-required", TASK_LIVE_TS + 201))
+            .unwrap();
+        store
+            .put_task(&sample_task(ids[2], "completed", TASK_LIVE_TS + 202))
+            .unwrap();
+        store
+            .put_task(&sample_task(ids[3], "failed", TASK_LIVE_TS + 203))
+            .unwrap();
+        drop(store);
+    }
+    let reopened = MysqlStore::connect(&url).expect("reconnect");
+    let all = reopened.list_tasks().unwrap();
+    let mut mine = all
+        .iter()
+        .filter(|t| ids.contains(&t.task_id.as_str()))
+        .map(|t| t.task_id.clone())
+        .collect::<Vec<_>>();
+    mine.sort();
+    let mut want = ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    want.sort();
+    assert_eq!(
+        mine,
+        want,
+        "list_tasks is unfiltered: terminal rows are returned too, and every row survives a \
+         reconnect. Got {} rows back in total, which is the accept-and-keep-nothing default this \
+         backend exists to replace",
+        all.len()
+    );
+    reset_tasks(&reopened, &ids);
+}
+
+/// The per-task provenance chain, read back off the server after a reconnect. Per-TASK rather than
+/// one global chain, so the scope of a read is one task and the links have to hold within it.
+///
+/// Note what this test does NOT do: it never calls `put_task`. That is deliberate. A `task.submitted`
+/// event and the first `put_task` are two independent write-throughs and the contract states no
+/// ordering between them, so appending an event for a task with no row yet has to WORK — which is
+/// why `task_events` carries no foreign key to `tasks` (see the schema).
+#[test]
+fn a_task_event_chain_survives_a_reconnect_and_still_links() {
+    let Some(url) = test_url() else { return };
+    let (t1, t2) = ("t_chain_1", "t_chain_2");
+    {
+        let store = MysqlStore::connect(&url).expect("connect");
+        reset_tasks(&store, &[t1, t2]);
+        store
+            .append_task_event(&sample_event(t1, 1, "task.submitted", "", "e1"))
+            .unwrap();
+        store
+            .append_task_event(&sample_event(t1, 2, "task.working", "e1", "e2"))
+            .unwrap();
+        store
+            .append_task_event(&sample_event(t1, 3, "task.interrupted", "e2", "e3"))
+            .unwrap();
+        // A second task's chain is independent — it must not leak into the first one's read.
+        store
+            .append_task_event(&sample_event(t2, 1, "task.submitted", "", "f1"))
+            .unwrap();
+        drop(store);
+    }
+    let reopened = MysqlStore::connect(&url).expect("reconnect");
+    let got = reopened.list_task_events(t1).unwrap();
+    assert_eq!(
+        got.len(),
+        3,
+        "the provenance chain must survive a reconnect; got {} events back, which is the \
+         accept-and-keep-nothing default this backend exists to replace",
+        got.len()
+    );
+    assert_eq!(
+        got.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "oldest-first by seq, which is the order the chain verifier reads"
+    );
+    assert_eq!(got[0].prev_hash, "", "seq 1 opens the chain");
+    for w in got.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the per-task chain must still link after a reconnect: seq {} carries prev_hash {:?} \
+             but seq {} persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    // Every field round-trips, including the join key that is deliberately NOT chained.
+    assert_eq!(got[2].kind, "task.interrupted");
+    assert_eq!(got[2].request_id, "req-3");
+    assert_eq!(got[1].context_id, format!("ctx-{t1}"));
+    assert_eq!(got[1].principal, "vk_a");
+    assert_eq!(got[1].agent_id, "planner");
+    assert_eq!(got[1].state, "working");
+    assert_eq!(got[1].ts, TASK_LIVE_TS + 2);
+    // The scope of a read is one task.
+    assert_eq!(reopened.list_task_events(t2).unwrap().len(), 1);
+    assert!(
+        reopened
+            .list_task_events("t_unknown_chain")
+            .unwrap()
+            .is_empty(),
+        "a task with no events reads back empty, not an error"
+    );
+    reset_tasks(&reopened, &[t1, t2]);
+}
+
+/// A replayed `(task_id, seq)` UPSERTS. This is where the task-event contract genuinely DIFFERS from
+/// `append_mcp_call`'s, and a backend that copied the call log's fork check would be wrong in a way
+/// that looks right: the contract says a store "must upsert on that pair — the write-through is
+/// idempotent on replay, and rejecting or duplicating a replayed `seq` breaks the chain the engine
+/// will verify on read". So neither a duplicate row nor an error, on either an identical replay or a
+/// corrected one.
+#[test]
+fn a_replayed_task_event_upserts_rather_than_duplicating_or_erroring() {
+    let Some(url) = test_url() else { return };
+    let store = MysqlStore::connect(&url).expect("connect");
+    let t = "t_replay_event";
+    reset_tasks(&store, &[t]);
+
+    let e = sample_event(t, 1, "task.submitted", "", "e1");
+    store.append_task_event(&e).unwrap();
+    store
+        .append_task_event(&e)
+        .expect("an identical replay must succeed, not be rejected as a fork");
+    assert_eq!(
+        store.list_task_events(t).unwrap().len(),
+        1,
+        "a replay must not duplicate the row"
+    );
+
+    // A rewritten event at the same seq REPLACES, per the contract's "must upsert on that pair".
+    let mut corrected = sample_event(t, 1, "task.submitted", "", "e1-corrected");
+    corrected.state = "submitted".to_string();
+    store.append_task_event(&corrected).unwrap();
+    let got = store.list_task_events(t).unwrap();
+    assert_eq!(got.len(), 1, "an upsert replaces; it does not append");
+    assert_eq!(got[0].hash, "e1-corrected");
+    assert_eq!(got[0].state, "submitted");
+    reset_tasks(&store, &[t]);
+}
+
+/// Retention drops TERMINAL rows only, strictly older than the cutoff, and returns a count it
+/// actually performed. An interrupted task waiting on a human is exactly the row that legitimately
+/// sits still for a long time; compacting it is losing the work, not reclaiming space.
+#[test]
+fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
+    let Some(url) = test_url() else { return };
+    let _guard = lock_task_purge();
+    let store = MysqlStore::connect(&url).expect("connect");
+    // Own the whole low band for the duration of the lock: a previous run's leftovers would
+    // otherwise be counted by the exact-count assertions below.
+    clear_purge_band(&store);
+
+    let old = 1_000_000_100;
+    let terminal = ["completed", "failed", "canceled", "rejected"];
+    for state in terminal {
+        store
+            .put_task(&sample_task(&format!("t_purge_old_{state}"), state, old))
+            .unwrap();
+    }
+    // Old, and NOT terminal — never dropped, no matter how old. `unrecognised-state` stands in for a
+    // token a NEWER engine emits that this build has never heard of: the terminal set is CLOSED, so
+    // an unknown token is kept rather than swept.
+    // `Completed` (capital C) is NOT the terminal token `completed`, and the difference has to
+    // survive the SQL. Under this schema's default collation (utf8mb4_0900_ai_ci, case-insensitive)
+    // `'Completed' IN ('completed', ...)` is TRUE, so a state token a newer engine minted would be
+    // swept by a terminal set that never recognised it — which is what the utf8mb4_bin collation on
+    // `tasks.state` exists to stop.
+    for state in [
+        "input-required",
+        "auth-required",
+        "working",
+        "submitted",
+        "unrecognised-state",
+        "Completed",
+    ] {
+        store
+            .put_task(&sample_task(&format!("t_purge_old_{state}"), state, old))
+            .unwrap();
+    }
+    // Terminal but at the cutoff exactly, and terminal but newer — both kept.
+    store
+        .put_task(&sample_task(
+            "t_purge_at_cutoff",
+            "completed",
+            1_000_000_200,
+        ))
+        .unwrap();
+    store
+        .put_task(&sample_task("t_purge_newer", "completed", 1_000_000_300))
+        .unwrap();
+
+    let purged = store.purge_tasks_before(1_000_000_200).unwrap();
+    assert_eq!(
+        purged, 4,
+        "only the four TERMINAL rows strictly older than the cutoff go, and the count must be one \
+         actually performed rather than a guess"
+    );
+    let mut left = store
+        .list_tasks()
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.updated_at < TASK_PURGE_BAND_TOP)
+        .map(|t| t.task_id)
+        .collect::<Vec<_>>();
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            "t_purge_at_cutoff",
+            "t_purge_newer",
+            "t_purge_old_Completed",
+            "t_purge_old_auth-required",
+            "t_purge_old_input-required",
+            "t_purge_old_submitted",
+            "t_purge_old_unrecognised-state",
+            "t_purge_old_working",
+        ],
+        "an active or interrupted task is never dropped by retention, an unrecognised state token \
+         is never dropped at all (`Completed` is not `completed`), and `before` is strictly \
+         less-than so a row exactly at the cutoff is kept"
+    );
+    assert_eq!(
+        store.purge_tasks_before(1_000_000_200).unwrap(),
+        0,
+        "re-running the same purge removes nothing"
+    );
+    clear_purge_band(&store);
+}
+
+/// Retention has to bound the EVENT table too. The trait offers no `purge_task_events_before`, so if
+/// purging a task left its provenance behind, `task_events` would grow without any bound the
+/// contract provides a way to apply. Dropping a task therefore drops the chain that belongs to it —
+/// and drops nothing belonging to any other task.
+#[test]
+fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
+    let Some(url) = test_url() else { return };
+    let _guard = lock_task_purge();
+    let store = MysqlStore::connect(&url).expect("connect");
+    clear_purge_band(&store);
+
+    let (gone, stays) = ("t_cascade_gone", "t_cascade_stays");
+    store
+        .put_task(&sample_task(gone, "completed", 1_000_000_100))
+        .unwrap();
+    store
+        .put_task(&sample_task(stays, "working", 1_000_000_100))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(gone, 1, "task.submitted", "", "g1"))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(gone, 2, "task.completed", "g1", "g2"))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(stays, 1, "task.submitted", "", "s1"))
+        .unwrap();
+
+    assert_eq!(
+        store.purge_tasks_before(1_000_000_200).unwrap(),
+        1,
+        "exactly the one terminal task in this band is swept, and the count must be one actually \
+         performed — 0 here is the accept-and-keep-nothing default this backend exists to replace"
+    );
+    assert!(
+        store.list_task_events(gone).unwrap().is_empty(),
+        "the purged task's events go with it; otherwise task_events grows unbounded, because the \
+         contract offers no other way to purge them"
+    );
+    assert_eq!(
+        store.list_task_events(stays).unwrap().len(),
+        1,
+        "another task's chain must be untouched by that purge"
+    );
+    reset_tasks(&store, &[gone, stays]);
+    clear_purge_band(&store);
+}
+
+/// Every `u64` field of both rows round-trips at the FULL range, `u64::MAX` included. That is a
+/// property of the schema, not an accident: these columns are `BIGINT UNSIGNED`, the same choice
+/// every other u64 in this store already gets, so there is no value the contract can hand this
+/// backend that it has to refuse or silently mangle. A signed `BIGINT` would have needed a
+/// range guard here, and an artifact cursor that wrapped negative and clamped back on read would
+/// either replay delivered artifacts or skip undelivered ones with no error ever reported.
+#[test]
+fn the_task_store_round_trips_the_full_u64_range() {
+    let Some(url) = test_url() else { return };
+    let store = MysqlStore::connect(&url).expect("connect");
+    let t = "t_full_range";
+    reset_tasks(&store, &[t]);
+
+    let mut task = sample_task(t, "working", u64::MAX);
+    task.artifact_cursor = u64::MAX;
+    task.created_at = u64::MAX;
+    store
+        .put_task(&task)
+        .expect("BIGINT UNSIGNED holds the whole u64 range; nothing here needs refusing");
+    let got = store.get_task(t).unwrap().expect(
+        "the task must read back at all before its range can be checked; None here is the \
+         accept-and-keep-nothing default this backend exists to replace",
+    );
+    assert_eq!(got.artifact_cursor, u64::MAX, "the cursor must not wrap");
+    assert_eq!(got.created_at, u64::MAX);
+    assert_eq!(got.updated_at, u64::MAX);
+
+    let mut ev = sample_event(t, u64::MAX, "task.submitted", "", "e1");
+    ev.ts = u64::MAX;
+    store.append_task_event(&ev).expect("seq/ts hold u64::MAX");
+    let events = store.list_task_events(t).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].seq, u64::MAX);
+    assert_eq!(events[0].ts, u64::MAX);
+
+    reset_tasks(&store, &[t]);
+}
+
+/// Two task ids differing only in CASE are two different tasks, and the primary key has to agree.
+/// Under this schema's default collation (utf8mb4_0900_ai_ci) they compare EQUAL, so the second
+/// `put_task` would upsert onto the first one's row and one of the two tasks would simply be gone —
+/// silently, with the write reporting success. `tasks.task_id` is `utf8mb4_bin` to stop exactly that.
+#[test]
+fn task_ids_differing_only_in_case_are_distinct_tasks() {
+    let Some(url) = test_url() else { return };
+    let store = MysqlStore::connect(&url).expect("connect");
+    let (lower, upper) = ("t_case_variant", "T_CASE_VARIANT");
+    reset_tasks(&store, &[lower, upper]);
+
+    store
+        .put_task(&sample_task(lower, "working", TASK_LIVE_TS + 1))
+        .unwrap();
+    store
+        .put_task(&sample_task(upper, "completed", TASK_LIVE_TS + 2))
+        .expect("a case-different id is a different task, not an upsert onto the first");
+
+    let a = store.get_task(lower).unwrap().expect("the lower-case task");
+    let b = store.get_task(upper).unwrap().expect("the upper-case task");
+    assert_eq!(a.task_id, lower, "an exact-match lookup must not case-fold");
+    assert_eq!(b.task_id, upper);
+    assert_eq!(
+        a.state, "working",
+        "the second put must not have overwritten the first task's row"
+    );
+    assert_eq!(b.state, "completed");
+
+    // The per-task event chains are scoped just as exactly.
+    store
+        .append_task_event(&sample_event(lower, 1, "task.submitted", "", "l1"))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(upper, 1, "task.submitted", "", "u1"))
+        .unwrap();
+    assert_eq!(store.list_task_events(lower).unwrap()[0].hash, "l1");
+    assert_eq!(
+        store.list_task_events(upper).unwrap()[0].hash,
+        "u1",
+        "a case-different task id is a different chain, not the same (task_id, seq) slot"
+    );
+
+    reset_tasks(&store, &[lower, upper]);
+}
+
+/// The band the purge tests own, cleared wholesale. Safe only under `lock_task_purge`, and correct
+/// only because every non-purge task test writes above `TASK_PURGE_BAND_TOP`.
+fn clear_purge_band(store: &MysqlStore) {
+    let mut conn = store.conn().expect("conn");
+    conn.exec_drop(
+        "DELETE FROM task_events WHERE task_id IN (SELECT task_id FROM tasks WHERE updated_at < :top)",
+        params! { "top" => TASK_PURGE_BAND_TOP },
+    )
+    .expect("clear the purge band's events");
+    conn.exec_drop(
+        "DELETE FROM tasks WHERE updated_at < :top",
+        params! { "top" => TASK_PURGE_BAND_TOP },
+    )
+    .expect("clear the purge band");
+}
+
+/// The v4 -> v5 crossing is additive: a real v4 database gains `tasks` and `task_events` and keeps
+/// every row it already had. Runs the REAL `MysqlStore::connect` wiring (real `store_meta` read,
+/// real table names) against a DEDICATED throwaway database, for the same reason
+/// `try_init_schema_real_wiring_backfills_a_genuinely_pre_v2_database` does: seeding a pre-v5
+/// `schema_version` marker in the shared `busbar_test` would race every other test's `connect()`.
+#[test]
+fn migrate_v4_to_v5_adds_the_task_store_without_wiping_data() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(url) = test_url() else { return };
+    let db_name = format!(
+        "busbar_taskmig_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let root_url = url.replacen("busbar:busbar@", "root:busbar@", 1);
+    let root_pool = Pool::new(Opts::from_url(&root_url).unwrap()).unwrap();
+    let mut root_conn = root_pool.get_conn().unwrap();
+    root_conn
+        .query_drop(format!("CREATE DATABASE {db_name}"))
+        .unwrap();
+    root_conn
+        .query_drop(format!(
+            "GRANT ALL PRIVILEGES ON {db_name}.* TO 'busbar'@'%'"
+        ))
+        .unwrap();
+    let dedicated_url = {
+        let cut = url
+            .rfind('/')
+            .expect("test_url() must be a mysql:// URL with a /database path");
+        format!("{}/{db_name}", &url[..cut])
+    };
+
+    // Boot once to build the real schema, then rewind this database to a genuine v4: drop the two
+    // new tables and put the marker back. Safe here — this database has no other concurrent user.
+    let store1 = MysqlStore::connect(&dedicated_url).expect("first boot must create the schema");
+    {
+        let mut conn = store1.pool.get_conn().unwrap();
+        conn.query_drop("DROP TABLE task_events").unwrap();
+        conn.query_drop("DROP TABLE tasks").unwrap();
+        conn.query_drop("UPDATE store_meta SET v = '4' WHERE k = 'schema_version'")
+            .unwrap();
+        conn.query_drop(
+            "INSERT INTO api_keys (id, name, key_group, allowed_pools, labels, enabled, \
+             generation_hash, created_at, updated_at, revision) \
+             VALUES ('vk_v4', 'n', '', NULL, '{}', 1, 'g1', 0, 0, 0)",
+        )
+        .unwrap();
+    }
+    drop(store1);
+
+    let store2 = MysqlStore::connect(&dedicated_url).expect("a v4 database must migrate to v5");
+    let survived = store2.get_key("vk_v4").unwrap().is_some();
+    store2
+        .put_task(&sample_task("t_v5", "working", TASK_LIVE_TS))
+        .expect("the newly created tasks table must be writable after the migration");
+    store2
+        .append_task_event(&sample_event("t_v5", 1, "task.submitted", "", "e1"))
+        .expect("the newly created task_events table must be writable after the migration");
+    let task_back = store2.get_task("t_v5").unwrap().is_some();
+    let events_back = store2.list_task_events("t_v5").unwrap().len();
+    drop(store2);
+
+    root_conn
+        .query_drop(format!("DROP DATABASE {db_name}"))
+        .unwrap();
+
+    assert!(
+        survived,
+        "a real v4 key must survive the v4->v5 crossing; the migration is purely additive"
+    );
+    assert!(task_back, "the migrated tasks table must read back");
+    assert_eq!(
+        events_back, 1,
+        "the migrated task_events table must read back"
+    );
 }

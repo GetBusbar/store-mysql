@@ -40,8 +40,7 @@ use mysql::{params, Opts, Pool, PooledConn, TxOpts};
 use busbar_api::{
     AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, MeteringDelta, MeteringRow,
     ModelTokens, ModelTokensDelta, ScopeRef, SecretForm, Store, StoreError, StoreResult,
-    TierTokens, UsageDelta,
-    UsageLedger, VirtualKey,
+    TaskEventRow, TaskRow, TierTokens, UsageDelta, UsageLedger, VirtualKey,
 };
 
 type MeteringRowTuple = (
@@ -61,6 +60,44 @@ type AuditRowTuple = (u64, u64, String, String, String, String, String, String);
 
 /// `(principal, seq, ts, prev_hash, hash, body)` as selected by `list_mcp_calls`.
 type McpCallRowTuple = (String, u64, u64, String, String, String);
+
+/// `(task_id, context_id, principal, direction, state, agent_id, artifact_cursor, push_callback,
+/// created_at, updated_at)` as selected by `get_task`/`list_tasks`.
+type TaskRowTuple = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    u64,
+    String,
+    u64,
+    u64,
+);
+
+/// `(task_id, seq, ts, kind, context_id, principal, agent_id, state, request_id, prev_hash, hash)`
+/// as selected by `list_task_events`.
+type TaskEventRowTuple = (
+    String,
+    u64,
+    u64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+/// The CLOSED set of terminal task states the retention sweep is allowed to drop, matching the
+/// tokens the trait's `TaskRow::state` documents. Closed in the SAFE direction on purpose: a state
+/// token minted by a NEWER engine than this build is not in the list, so it is never swept — the
+/// failure mode of guessing wrong is a row kept too long, not work destroyed.
+const TERMINAL_TASK_STATES: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
+
 fn store_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError(e.to_string())
 }
@@ -73,7 +110,10 @@ fn store_err<E: std::fmt::Display>(e: E) -> StoreError {
 /// the table and its index are new, so their `SCHEMA` statements (run on every boot, with the
 /// duplicate-object error swallowed) are the entire migration. Nothing is dropped and no existing
 /// row is touched, which is why no `V4_*` constant joins the two below.
-const SCHEMA_VERSION: u32 = 4;
+/// v5: the durable A2A TASK STORE (`tasks`, `task_events`). Additive on exactly the same terms as
+/// v4 — two new tables and one new index, so their `SCHEMA` statements ARE the migration, nothing is
+/// dropped and no existing row is touched. No `V5_*` constant either, for the same reason.
+const SCHEMA_VERSION: u32 = 5;
 
 /// The version each one-time migration step targets crossing INTO — named so a gate reads as "did
 /// this database predate step N" rather than a bare magic number, and so a future step can't be
@@ -231,6 +271,91 @@ const SCHEMA: &[&str] = &[
     // principal. No IF NOT EXISTS -- MySQL has no such form for CREATE INDEX; a re-run's duplicate
     // error is swallowed by try_init_schema, exactly as it is for idx_audit_resource_seq.
     "CREATE INDEX idx_mcp_calls_ts ON mcp_calls (ts)",
+    // THE DURABLE A2A TASK STORE. A2A is async BY DESIGN: a task spans turns, can sit interrupted
+    // waiting on a human, and can outlive the process that started it. An in-memory task table
+    // therefore loses every in-flight task on restart, which is the difference between a resume that
+    // is real and one that is nominal.
+    //
+    // Every TaskRow field is a REAL column rather than an opaque body, and that is the opposite of
+    // the shape mcp_calls uses, for a reason: mcp_calls is written once and read back whole, whereas
+    // these rows are the working set the engine QUERIES -- the retention sweep filters on
+    // (state, updated_at), the boot rehydrate partitions on state, and a stale artifact_cursor
+    // decides whether a resubscribe replays delivered artifacts or skips undelivered ones. A field
+    // reachable only by decoding a blob can be neither indexed nor constrained.
+    //
+    // Every u64 is BIGINT UNSIGNED, as every other u64 in this schema already is, so the FULL u64
+    // range round-trips and there is no value the contract can hand this backend that it must refuse
+    // or silently mangle. Signed BIGINT would wrap `artifact_cursor` negative past i64::MAX and clamp
+    // it back on read -- a row that does not read back as itself, with no error ever reported.
+    //
+    // `state` is deliberately UNCONSTRAINED (no CHECK, no ENUM): a task state token minted by a
+    // NEWER engine than the one this schema was written against must store and read back verbatim.
+    // Only the retention sweep's TERMINAL_TASK_STATES list is a closed set, and it is closed in the
+    // safe direction -- an unrecognised token is never swept.
+    //
+    // COLLATE utf8mb4_bin on `task_id` and `state`, and it is load-bearing on both. This schema's
+    // default collation is utf8mb4_0900_ai_ci -- CASE- AND ACCENT-INSENSITIVE -- under which
+    // `'Completed' IN ('completed', ...)` is TRUE and two task ids differing only in case COLLIDE
+    // ON THE PRIMARY KEY. That defeats both guarantees this table is supposed to make: the terminal
+    // set would sweep a state token it does not actually recognise (the exact failure the closed set
+    // exists to prevent), and two distinct tasks would silently upsert onto one row, losing one of
+    // them. Binary rather than `CHARACTER SET ascii` because a task id is an opaque
+    // protocol-supplied string: ascii would HARD-FAIL a non-ASCII id under STRICT_ALL_TABLES,
+    // whereas utf8mb4_bin stores the full range and still compares exactly. Same class of bug the
+    // v3 migration closed for `usage_metering.key_group_at_use`.
+    //
+    // The other columns keep the default collation on purpose: this store only ever stores them and
+    // returns them verbatim, and never compares one against a literal.
+    "CREATE TABLE IF NOT EXISTS tasks (
+        task_id VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        context_id VARCHAR(191) NOT NULL DEFAULT '',
+        principal VARCHAR(191) NOT NULL DEFAULT '',
+        direction VARCHAR(16) NOT NULL DEFAULT '',
+        state VARCHAR(64) COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+        agent_id VARCHAR(191) NOT NULL DEFAULT '',
+        artifact_cursor BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        -- TEXT, not VARCHAR(n): a push callback is an operator-supplied URL with no length this
+        -- schema can honestly bound, and under STRICT_ALL_TABLES a guessed-too-short ceiling is a
+        -- hard write failure on a task that was otherwise fine. Never indexed, never matched on.
+        push_callback TEXT NOT NULL,
+        created_at BIGINT UNSIGNED NOT NULL,
+        updated_at BIGINT UNSIGNED NOT NULL,
+        PRIMARY KEY (task_id)
+    ) ENGINE=InnoDB",
+    // The retention sweep's access path -- purge_tasks_before filters on exactly (state, updated_at)
+    // -- in that column order, because the sweep names a closed set of states and then a range on
+    // updated_at, and an index is only usable for a range on its LAST consulted column.
+    "CREATE INDEX idx_tasks_state_updated ON tasks (state, updated_at)",
+    // PER-TASK PROVENANCE, hash-chained WITHIN a task. Per-task rather than one global chain because
+    // tasks are concurrent and long-lived: a global chain would serialise every task transition
+    // behind one append and would make one task's provenance unverifiable without possessing every
+    // other tenant's events. The chain columns -- seq, prev_hash, hash -- are REAL columns for the
+    // same reason they are in mcp_calls: durability here is established by READING THE CHAIN BACK,
+    // and this store NEVER computes or recomputes a digest.
+    //
+    // NO FOREIGN KEY to `tasks`, deliberately, even though the purge cascade below is exactly what
+    // one would buy. An FK would also impose an ORDER on the writes -- no event could be appended
+    // before its task row existed -- and the engine is under no such obligation: a `task.submitted`
+    // event and the first `put_task` are two independent write-throughs and the contract states no
+    // ordering between them. A DELETE trigger, which is how store-sqlite gets the cascade without
+    // the ordering constraint, is not available here either: creating one needs SUPER (ER_NOT_SUPER,
+    // 1419) on any server with binary logging on, which the mysql:8 image CI runs has by default and
+    // the app-level `busbar` user does not hold. So the cascade lives in `purge_tasks_before`, in the
+    // same transaction as the parent delete -- see that method.
+    "CREATE TABLE IF NOT EXISTS task_events (
+        task_id VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        seq BIGINT UNSIGNED NOT NULL,
+        ts BIGINT UNSIGNED NOT NULL,
+        kind VARCHAR(64) NOT NULL DEFAULT '',
+        context_id VARCHAR(191) NOT NULL DEFAULT '',
+        principal VARCHAR(191) NOT NULL DEFAULT '',
+        agent_id VARCHAR(191) NOT NULL DEFAULT '',
+        state VARCHAR(64) NOT NULL DEFAULT '',
+        request_id VARCHAR(191) NOT NULL DEFAULT '',
+        prev_hash CHAR(64) NOT NULL DEFAULT '',
+        hash CHAR(64) NOT NULL DEFAULT '',
+        PRIMARY KEY (task_id, seq)
+    ) ENGINE=InnoDB",
 ];
 
 /// MySQL/MariaDB-backed [`Store`]. A single mutex-guarded pooled connection is used for all control-
@@ -1575,6 +1700,163 @@ impl Store for MysqlStore {
         tx.commit().map_err(store_err)
     }
 
+    fn put_task(&self, task: &TaskRow) -> StoreResult<()> {
+        // UPSERT BY task_id: the engine writes through on EVERY state transition, so a second write
+        // for one task must REPLACE the row, never append a second one for the same id.
+        //
+        // No `affected_rows` check follows, deliberately. MySQL reports 1 for an insert, 2 for a row
+        // it actually changed and 0 for an update that changed nothing, so the number cannot tell
+        // "stored" from "failed" here — correctness rests on the statement succeeding, not on a
+        // count whose three values all mean the write landed.
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "INSERT INTO tasks (task_id, context_id, principal, direction, state, agent_id, \
+             artifact_cursor, push_callback, created_at, updated_at) \
+             VALUES (:task_id, :context_id, :principal, :direction, :state, :agent_id, \
+             :artifact_cursor, :push_callback, :created_at, :updated_at) \
+             ON DUPLICATE KEY UPDATE \
+                context_id = VALUES(context_id), principal = VALUES(principal), \
+                direction = VALUES(direction), state = VALUES(state), \
+                agent_id = VALUES(agent_id), artifact_cursor = VALUES(artifact_cursor), \
+                push_callback = VALUES(push_callback), created_at = VALUES(created_at), \
+                updated_at = VALUES(updated_at)",
+            params! {
+                "task_id" => &task.task_id, "context_id" => &task.context_id,
+                "principal" => &task.principal, "direction" => &task.direction,
+                "state" => &task.state, "agent_id" => &task.agent_id,
+                "artifact_cursor" => task.artifact_cursor,
+                "push_callback" => &task.push_callback,
+                "created_at" => task.created_at, "updated_at" => task.updated_at,
+            },
+        )
+        .map_err(store_err)
+    }
+
+    fn get_task(&self, task_id: &str) -> StoreResult<Option<TaskRow>> {
+        // No principal filter, deliberately: the contract puts the caller-scoping check ENGINE-side,
+        // because an authorization check living in the backend is one an unauthorized reader
+        // bypasses by configuring a different backend.
+        let mut conn = self.conn()?;
+        let row: Option<TaskRowTuple> = conn
+            .exec_first(
+                "SELECT task_id, context_id, principal, direction, state, agent_id, \
+                 artifact_cursor, push_callback, created_at, updated_at FROM tasks \
+                 WHERE task_id = :task_id",
+                params! { "task_id" => task_id },
+            )
+            .map_err(store_err)?;
+        Ok(row.map(row_to_task))
+    }
+
+    fn list_tasks(&self) -> StoreResult<Vec<TaskRow>> {
+        // UNFILTERED, terminal rows included. The boot rehydrate wants the active rows, the
+        // retention sweep wants the terminal ones and the scoped listing wants one principal's; a
+        // store that pre-filtered for any one of those would break the other two.
+        let mut conn = self.conn()?;
+        let rows: Vec<TaskRowTuple> = conn
+            .query(
+                "SELECT task_id, context_id, principal, direction, state, agent_id, \
+                 artifact_cursor, push_callback, created_at, updated_at FROM tasks ORDER BY task_id",
+            )
+            .map_err(store_err)?;
+        Ok(rows.into_iter().map(row_to_task).collect())
+    }
+
+    fn purge_tasks_before(&self, before: u64) -> StoreResult<u64> {
+        // TERMINAL ONLY, and STRICTLY older than the cutoff. An interrupted task waiting on a human
+        // is exactly the row that legitimately sits still for a long time; compacting it is losing
+        // the work, not reclaiming space. The IN list is the CLOSED terminal set, so a state token
+        // minted by a newer engine than this build is never dropped.
+        //
+        // The events go with the task, in the SAME TRANSACTION as the parent delete. That cascade is
+        // load-bearing rather than tidiness: `purge_tasks_before` is the ONLY retention method the
+        // contract gives this data, so a purge that left the events behind would leave `task_events`
+        // with no bound anywhere in the trait. It is done here in application code because neither
+        // way of pushing it into the schema is available (see the `task_events` DDL): a foreign key
+        // would impose a write ORDER the contract never states, and a DELETE trigger needs SUPER on
+        // a binlog-enabled server, which the app-level user does not hold. One transaction is what
+        // makes the pair atomic anyway — a crash between the two statements cannot leave a task
+        // whose chain has been half-swept.
+        let placeholders = (0..TERMINAL_TASK_STATES.len())
+            .map(|i| format!(":s{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut args: Vec<(String, mysql::Value)> = vec![("before".to_string(), before.into())];
+        for (i, state) in TERMINAL_TASK_STATES.iter().enumerate() {
+            args.push((format!("s{i}"), (*state).into()));
+        }
+
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(store_err)?;
+        tx.exec_drop(
+            format!(
+                "DELETE te FROM task_events te JOIN tasks t ON te.task_id = t.task_id \
+                 WHERE t.updated_at < :before AND t.state IN ({placeholders})"
+            ),
+            args.clone(),
+        )
+        .map_err(store_err)?;
+        tx.exec_drop(
+            format!("DELETE FROM tasks WHERE updated_at < :before AND state IN ({placeholders})"),
+            args,
+        )
+        .map_err(store_err)?;
+        // Read BEFORE the commit: `affected_rows` reports the LAST statement executed on this
+        // connection, and the COMMIT itself is one. This is the count the DELETE actually performed,
+        // never an estimate.
+        let removed = tx.affected_rows();
+        tx.commit().map_err(store_err)?;
+        Ok(removed)
+    }
+
+    fn append_task_event(&self, event: &TaskEventRow) -> StoreResult<()> {
+        // UPSERT ON (task_id, seq), and this is where the task-event contract genuinely DIFFERS from
+        // `append_mcp_call`'s: that one treats an occupied slot holding a DIFFERENT record as a fork
+        // and refuses it, while this one is specified to upsert so the engine's write-through is
+        // idempotent on replay — "rejecting or duplicating a replayed `seq` breaks the chain the
+        // engine will verify on read". Copying the call log's fork check here would be wrong in a
+        // way that looks right, so it is stated rather than left to be inferred from the SQL.
+        //
+        // As in `put_task`, no `affected_rows` check: ON DUPLICATE KEY UPDATE returns 2 for a row it
+        // changed and 0 for a replay identical to what is already stored, and 0 is a SUCCESS here.
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "INSERT INTO task_events (task_id, seq, ts, kind, context_id, principal, agent_id, \
+             state, request_id, prev_hash, hash) \
+             VALUES (:task_id, :seq, :ts, :kind, :context_id, :principal, :agent_id, :state, \
+             :request_id, :prev_hash, :hash) \
+             ON DUPLICATE KEY UPDATE \
+                ts = VALUES(ts), kind = VALUES(kind), context_id = VALUES(context_id), \
+                principal = VALUES(principal), agent_id = VALUES(agent_id), \
+                state = VALUES(state), request_id = VALUES(request_id), \
+                prev_hash = VALUES(prev_hash), hash = VALUES(hash)",
+            params! {
+                "task_id" => &event.task_id, "seq" => event.seq, "ts" => event.ts,
+                "kind" => &event.kind, "context_id" => &event.context_id,
+                "principal" => &event.principal, "agent_id" => &event.agent_id,
+                "state" => &event.state, "request_id" => &event.request_id,
+                "prev_hash" => &event.prev_hash, "hash" => &event.hash,
+            },
+        )
+        .map_err(store_err)
+    }
+
+    fn list_task_events(&self, task_id: &str) -> StoreResult<Vec<TaskEventRow>> {
+        // Oldest-first by seq — the order the engine's chain verifier reads — and the scope is the
+        // one task, because the chain is per-task.
+        let mut conn = self.conn()?;
+        let rows: Vec<TaskEventRowTuple> = conn
+            .exec(
+                "SELECT task_id, seq, ts, kind, context_id, principal, agent_id, state, \
+                 request_id, prev_hash, hash FROM task_events WHERE task_id = :task_id ORDER BY seq",
+                params! { "task_id" => task_id },
+            )
+            .map_err(store_err)?;
+        Ok(rows.into_iter().map(row_to_task_event).collect())
+    }
+
     fn append_mcp_call(&self, record: &McpCallRecord) -> StoreResult<()> {
         let body = mcp_call_body(record);
         let mut conn = self.conn()?;
@@ -1682,6 +1964,67 @@ fn mcp_call_body(record: &McpCallRecord) -> String {
 /// Rebuild a record from its columns plus its opaque body. The CHAIN comes from the columns, which
 /// is the point of their being columns: what the engine verifies is what the database holds in a
 /// field it can constrain, not a value recovered by decoding a payload.
+/// No clamping and no fallback anywhere in here, unlike `row_to_mcp_call`'s tolerant body decode:
+/// every field is a real, NOT NULL column of a known type, so a row that fails to decode is a schema
+/// that is not what this build thinks it is — and the driver reports that rather than this function
+/// papering over it with a default. The u64s round-trip exactly because the columns are
+/// `BIGINT UNSIGNED`.
+fn row_to_task(row: TaskRowTuple) -> TaskRow {
+    let (
+        task_id,
+        context_id,
+        principal,
+        direction,
+        state,
+        agent_id,
+        artifact_cursor,
+        push_callback,
+        created_at,
+        updated_at,
+    ) = row;
+    TaskRow {
+        task_id,
+        context_id,
+        principal,
+        direction,
+        state,
+        agent_id,
+        artifact_cursor,
+        push_callback,
+        created_at,
+        updated_at,
+    }
+}
+
+fn row_to_task_event(row: TaskEventRowTuple) -> TaskEventRow {
+    let (
+        task_id,
+        seq,
+        ts,
+        kind,
+        context_id,
+        principal,
+        agent_id,
+        state,
+        request_id,
+        prev_hash,
+        hash,
+    ) = row;
+    TaskEventRow {
+        task_id,
+        seq,
+        ts,
+        kind,
+        context_id,
+        principal,
+        agent_id,
+        state,
+        request_id,
+        prev_hash,
+        hash,
+    }
+}
+
 fn row_to_mcp_call(row: McpCallRowTuple) -> McpCallRecord {
     let (principal, seq, ts, prev_hash, hash, body) = row;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
