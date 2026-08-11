@@ -1893,6 +1893,62 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
     reset_calls(&store, &[p]);
 }
 
+/// THE CROSS-PRINCIPAL READ. `mcp_calls.principal` is half of the PRIMARY KEY and the ONLY predicate
+/// `list_mcp_calls` filters on, and this schema's default collation is `utf8mb4_0900_ai_ci` — case-
+/// AND accent-insensitive. Under that collation two busbar key ids differing only in case are the
+/// SAME key: one principal's `list_mcp_calls` hands back another principal's tool-call evidence, and
+/// the second principal's first `append_mcp_call` collides on the primary key and is reported back
+/// as a "fork" of a chain it has never written to.
+///
+/// This is the same defect `task_ids_differing_only_in_case_are_distinct_tasks` pins for `tasks` —
+/// which is why `tasks.task_id` and `tasks.state` carry `COLLATE utf8mb4_bin` and this column must
+/// too. A key id is an opaque identifier, never a word, and nothing in the contract makes `vk_A` and
+/// `vk_a` the same caller.
+#[test]
+fn principals_differing_only_in_case_are_distinct_chains() {
+    let Some(url) = test_url() else { return };
+    let store = MysqlStore::connect(&url).expect("connect");
+    let (lower, upper) = ("vk_mcp_case_variant", "VK_MCP_CASE_VARIANT");
+    reset_calls(&store, &[lower, upper]);
+
+    store
+        .append_mcp_call(&sample_call(lower, 1, 2_000_000_100, "", "lower1"))
+        .unwrap();
+    store
+        .append_mcp_call(&sample_call(upper, 1, 2_000_000_100, "", "upper1"))
+        .expect(
+            "a case-different principal is a DIFFERENT caller opening its own chain, never a fork \
+             of the first caller's",
+        );
+
+    let a = store.list_mcp_calls(lower).unwrap();
+    let b = store.list_mcp_calls(upper).unwrap();
+    assert_eq!(
+        a.len(),
+        1,
+        "a scoped read must return this principal's records and no other's"
+    );
+    assert_eq!(b.len(), 1);
+    assert_eq!(
+        a[0].hash, "lower1",
+        "an exact-match scoped read must not case-fold into another principal's chain"
+    );
+    assert_eq!(b[0].hash, "upper1");
+    assert_eq!(a[0].principal, lower);
+    assert_eq!(b[0].principal, upper);
+
+    let principals = store.list_mcp_call_principals().unwrap();
+    for want in [lower, upper] {
+        assert_eq!(
+            principals.iter().filter(|p| p.as_str() == want).count(),
+            1,
+            "{want} must be enumerated in its own right, not collapsed into its case variant"
+        );
+    }
+
+    reset_calls(&store, &[lower, upper]);
+}
+
 // ── THE DURABLE A2A TASK STORE ────────────────────────────────────────────────────────────────
 //
 // A2A is async by design: a task spans turns, can sit interrupted waiting on a human, and can

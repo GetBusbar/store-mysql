@@ -252,8 +252,20 @@ const SCHEMA: &[&str] = &[
     // is half of a PRIMARY KEY, and 191 is the utf8mb4 length that keeps a keyed column inside the
     // index limit on the older/utf8mb4-3072-byte configurations this store still supports (the same
     // reason store_meta.k is 191).
+    //
+    // COLLATE utf8mb4_bin on `principal`, and it is load-bearing for exactly the reason it is on
+    // `tasks.task_id`. This schema's default collation is utf8mb4_0900_ai_ci -- CASE- AND
+    // ACCENT-INSENSITIVE -- and `principal` is BOTH half of the PRIMARY KEY and the ONLY predicate
+    // `list_mcp_calls` filters on. Under the default collation two busbar key ids differing only in
+    // case are the SAME key to the server: `list_mcp_calls` hands one caller ANOTHER CALLER'S
+    // tool-call evidence, and the second caller's first append collides on the primary key and is
+    // reported back as a "fork" of a chain it has never written to. A key id is an opaque
+    // identifier, never a word, and nothing in the contract makes `vk_A` and `vk_a` one caller.
+    // Binary rather than `CHARACTER SET ascii` for the same reason as `tasks.task_id`: a key id may
+    // legitimately be non-ASCII, and ascii would HARD-FAIL that write under STRICT_ALL_TABLES.
+    // `principals_differing_only_in_case_are_distinct_chains` pins it.
     "CREATE TABLE IF NOT EXISTS mcp_calls (
-        principal VARCHAR(191) NOT NULL,
+        principal VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
         seq BIGINT UNSIGNED NOT NULL,
         ts BIGINT UNSIGNED NOT NULL,
         prev_hash CHAR(64) NOT NULL DEFAULT '',
