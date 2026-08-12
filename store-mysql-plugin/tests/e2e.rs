@@ -87,7 +87,9 @@ fn mysql_url() -> Option<String> {
 /// fail a perfectly current cdylib.
 fn newest_source_mtime() -> std::time::SystemTime {
     fn walk(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -463,7 +465,8 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
 
     // `MysqlStore::connect` runs the real schema migration, so the tables exist before the wipe —
     // and this same handle is leg 3's independent reader.
-    let direct = MysqlStore::connect(&url).expect("connect directly to migrate, clean up and verify");
+    let direct =
+        MysqlStore::connect(&url).expect("connect directly to migrate, clean up and verify");
     wipe_task_and_call_tables(&url);
 
     let task = |id: &str, state: &str, updated_at: u64| TaskRow {
@@ -655,13 +658,16 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
         vec!["t_alpha", "t_beta"],
         "the tasks must be physically present in MySQL, not just cached in-process by the plugin"
     );
-    let direct_events =
-        Store::list_task_events(&direct, "t_alpha").expect("list_task_events via the direct connection");
+    let direct_events = Store::list_task_events(&direct, "t_alpha")
+        .expect("list_task_events via the direct connection");
     assert_eq!(direct_events.len(), 3);
     assert_eq!(direct_events[2].hash, "e3");
     let direct_calls =
         Store::list_mcp_calls(&direct, "vk_abi").expect("list_mcp_calls via the direct connection");
-    assert_eq!(direct_calls.iter().map(|c| c.seq).collect::<Vec<_>>(), vec![2, 3]);
+    assert_eq!(
+        direct_calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
     assert_eq!(direct_calls[1].hash, "h3");
 
     wipe_task_and_call_tables(&url);
