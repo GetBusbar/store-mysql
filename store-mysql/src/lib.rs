@@ -38,9 +38,9 @@ use mysql::prelude::*;
 use mysql::{params, Opts, Pool, PooledConn, TxOpts};
 
 use busbar_api::{
-    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, MeteringDelta, MeteringRow,
-    ModelTokens, ModelTokensDelta, ScopeRef, SecretForm, Store, StoreError, StoreResult,
-    TaskEventRow, TaskRow, TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, McpDemotionRow, MeteringDelta,
+    MeteringRow, ModelTokens, ModelTokensDelta, ScopeRef, SecretForm, Store, StoreError,
+    StoreResult, TaskEventRow, TaskRow, TierTokens, UsageDelta, UsageLedger, VirtualKey,
 };
 
 type MeteringRowTuple = (
@@ -113,7 +113,12 @@ fn store_err<E: std::fmt::Display>(e: E) -> StoreError {
 /// v5: the durable A2A TASK STORE (`tasks`, `task_events`). Additive on exactly the same terms as
 /// v4 — two new tables and one new index, so their `SCHEMA` statements ARE the migration, nothing is
 /// dropped and no existing row is touched. No `V5_*` constant either, for the same reason.
-const SCHEMA_VERSION: u32 = 5;
+/// v6: the durable TRUST STATE (`mcp_demotions`, `spent_ask_states`) — the recorded quarantine of an
+/// upstream that drifted from what the operator approved, and the ledger that makes a single-use
+/// human approval single-use across a restart and across a fleet. Additive on exactly the same terms
+/// as v4 and v5: two new tables and one new index, so their `SCHEMA` statements ARE the migration.
+/// No `V6_*` constant either.
+const SCHEMA_VERSION: u32 = 6;
 
 /// The version each one-time migration step targets crossing INTO — named so a gate reads as "did
 /// this database predate step N" rather than a bare magic number, and so a future step can't be
@@ -368,6 +373,62 @@ const SCHEMA: &[&str] = &[
         hash CHAR(64) NOT NULL DEFAULT '',
         PRIMARY KEY (task_id, seq)
     ) ENGINE=InnoDB",
+    // THE DURABLE MCP DEMOTION RECORD. An engine demotes a registered upstream when the tool list it
+    // is currently serving disagrees with what the operator approved. That decision is derived in
+    // memory from a LIVE OBSERVATION, and a process that has taken no observation has nothing to
+    // derive it from -- a server nobody has looked at serves against the digest the operator wrote
+    // down, which is the declarative-approval behaviour every deployment without a live refresh
+    // depends on. Those two facts together are why this table exists: without it a restart hands a
+    // quarantined upstream its approval back until the next unattended sweep looks again.
+    //
+    // ONE ROW PER UPSTREAM, keyed by the operator's local registration id and upserted, so a second
+    // demotion of one server replaces the row rather than standing a rival one beside it. Carries no
+    // secret: `reason` is an engine-chosen word for an operator to read, never caller text.
+    //
+    // COLLATE utf8mb4_bin on `server`, and it is load-bearing for the reason it is on
+    // `tasks.task_id`. This schema's default collation is utf8mb4_0900_ai_ci -- CASE- AND
+    // ACCENT-INSENSITIVE -- under which two DISTINCT registered upstreams whose ids differ only in
+    // case collide on the PRIMARY KEY: quarantining one silently overwrites the other's record, and
+    // clearing one clears both. A registration id is an opaque operator-chosen string, never a word.
+    // Binary rather than `CHARACTER SET ascii` for the same reason `tasks.task_id` is: an id may
+    // legitimately be non-ASCII, and ascii would HARD-FAIL that write under STRICT_ALL_TABLES.
+    //
+    // VARCHAR(191) because the column is the PRIMARY KEY: 191 is the utf8mb4 length that keeps a
+    // keyed column inside the index limit on the older/utf8mb4-3072-byte configurations this store
+    // still supports (the same reason `store_meta.k` and `mcp_calls.principal` are 191).
+    //
+    // BIGINT UNSIGNED for `recorded_at`, matching every other timestamp in this schema: it holds the
+    // whole u64 range, so this backend never has to refuse or clamp a value the signed-BIGINT
+    // backends cannot store.
+    "CREATE TABLE IF NOT EXISTS mcp_demotions (
+        server VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        reason VARCHAR(191) NOT NULL DEFAULT '',
+        recorded_at BIGINT UNSIGNED NOT NULL,
+        PRIMARY KEY (server)
+    ) ENGINE=InnoDB",
+    // THE DURABLE SPENT-APPROVAL LEDGER. A sealed, single-use approval is what makes a confirm-once
+    // tool execute once, and the seal itself cannot carry that property: the second presentation of
+    // a redeemed approval is byte-identical to the first and verifies just as well. Only a RECORD
+    // THAT THE FIRST HAPPENED tells them apart, and in process memory that record dies with the
+    // process and is never shared with a second node -- while two nodes of one deployment share the
+    // signing key, and therefore share the seal. Here it is one ledger for the whole deployment.
+    //
+    // COLLATE utf8mb4_bin on `nonce` is the SHARPEST instance of the collation hazard in this file.
+    // Under the schema default the primary key stops distinguishing a nonce from its case- or
+    // accent-variants, so a ledger whose entire job is telling one approval from another would
+    // REFUSE a genuinely fresh approval -- the gate breaking for an operator who did nothing wrong --
+    // while folding an attacker's near-miss variants onto one row. Byte-exact is the only correct
+    // comparison for a random token, and it is stated rather than inherited.
+    "CREATE TABLE IF NOT EXISTS spent_ask_states (
+        nonce VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        expires_at BIGINT UNSIGNED NOT NULL,
+        PRIMARY KEY (nonce)
+    ) ENGINE=InnoDB",
+    // The eviction sweep's access path. Without it the sweep's `expires_at < :now` is a full table
+    // scan, and a scan under InnoDB's REPEATABLE READ takes a lock on every row it visits -- which
+    // on the one table every concurrent redemption in the fleet touches is how a sweep turns into a
+    // lock-wait storm between nodes that have nothing to do with each other.
+    "CREATE INDEX idx_spent_ask_states_expires ON spent_ask_states (expires_at)",
 ];
 
 /// MySQL/MariaDB-backed [`Store`]. A single mutex-guarded pooled connection is used for all control-
@@ -1945,6 +2006,103 @@ impl Store for MysqlStore {
     fn list_denylist(&self) -> StoreResult<Vec<String>> {
         let mut conn = self.conn()?;
         conn.query("SELECT sub FROM denylist").map_err(store_err)
+    }
+
+    fn put_mcp_demotion(&self, row: &McpDemotionRow) -> StoreResult<()> {
+        // UPSERT BY server, as the trait requires: a second demotion of one upstream REPLACES the
+        // row rather than appending a rival one, so the boot read cannot come back holding two
+        // answers about one server.
+        //
+        // No `affected_rows` check follows, deliberately, and for the same reason `put_task` has
+        // none: MySQL reports 1 for an insert, 2 for a row it actually changed and 0 for an update
+        // that changed nothing, so the number cannot tell "stored" from "failed" here. Correctness
+        // rests on the statement succeeding. (`redeem_ask_state` below is the one place where
+        // `affected_rows` IS the answer, and there the statement is written so the count is
+        // unambiguous.)
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "INSERT INTO mcp_demotions (server, reason, recorded_at) \
+             VALUES (:server, :reason, :recorded_at) \
+             ON DUPLICATE KEY UPDATE reason = VALUES(reason), recorded_at = VALUES(recorded_at)",
+            params! {
+                "server" => &row.server,
+                "reason" => &row.reason,
+                "recorded_at" => row.recorded_at,
+            },
+        )
+        .map_err(store_err)
+    }
+
+    fn list_mcp_demotions(&self) -> StoreResult<Vec<McpDemotionRow>> {
+        // The boot read that puts a demotion back in force before the first request is served. An
+        // EMPTY answer means "no upstream is recorded as demoted" and never "we could not tell" — a
+        // read failure surfaces as an Err, because a server with no row is a server nobody demoted,
+        // which is a different fact from a server that drifted, and conflating them would quarantine
+        // every declaratively-approved deployment at boot.
+        let mut conn = self.conn()?;
+        let rows: Vec<(String, String, u64)> = conn
+            .query("SELECT server, reason, recorded_at FROM mcp_demotions ORDER BY server")
+            .map_err(store_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(server, reason, recorded_at)| McpDemotionRow {
+                server,
+                reason,
+                recorded_at,
+            })
+            .collect())
+    }
+
+    fn clear_mcp_demotion(&self, server: &str) -> StoreResult<()> {
+        // Removing a row that is not there is a NO-OP, not an error: the engine clears on every
+        // observation that agrees with the operator's approval rather than tracking whether it had
+        // demoted, so the overwhelmingly common call is one against no row at all.
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "DELETE FROM mcp_demotions WHERE server = :server",
+            params! { "server" => server },
+        )
+        .map_err(store_err)
+    }
+
+    fn redeem_ask_state(&self, nonce: &str, expires_at: u64, now: u64) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        // THE EVICTION SWEEP the redemption carries, so the table is bounded by one
+        // approval-validity window rather than growing forever: an entry recording an approval that
+        // can no longer be opened protects nothing. STRICTLY less-than, so an entry expiring exactly
+        // at `now` is kept — the boundary convention every retention method in this crate uses. It
+        // runs BEFORE the insert, so it can never delete the row this very call is about to write.
+        //
+        // DELIBERATELY NOT IN A TRANSACTION WITH THE INSERT BELOW, and that is where this parts
+        // company with the Postgres backend's shape. The atomicity that matters belongs to the
+        // INSERT alone; wrapping the sweep in with it buys nothing and costs plenty, because InnoDB
+        // under REPEATABLE READ takes NEXT-KEY locks over the range a DELETE scans and holds them to
+        // commit — so every node's redemption would sit on a range lock across the one table the
+        // whole fleet writes to. The sweep is an independent, idempotent statement; a crash between
+        // the two leaves a ledger that is correct and merely one sweep behind.
+        conn.exec_drop(
+            "DELETE FROM spent_ask_states WHERE expires_at < :now",
+            params! { "now" => now },
+        )
+        .map_err(store_err)?;
+        // THE TEST AND SET, as ONE statement. `ON DUPLICATE KEY UPDATE nonce = nonce` makes the
+        // duplicate case a no-op that changes nothing, so `affected_rows` is exactly 1 when THIS
+        // call inserted the row and 0 when it was already there — the same idiom `append_audit` uses
+        // for its own occupied-slot check. Reading the table and then writing it would tell BOTH
+        // halves of a race they were first — two nodes behind a load balancer, or two requests to
+        // one node — and that is precisely the shape this method is specified not to have.
+        //
+        // INSERT IGNORE would give the same count and is NOT used: it downgrades every other error
+        // on the statement to a warning too, and a redemption that silently swallowed a write
+        // failure would answer `false` — refusing a legitimate approval — or, worse, `true` off a
+        // row that never landed.
+        conn.exec_drop(
+            "INSERT INTO spent_ask_states (nonce, expires_at) VALUES (:nonce, :expires_at) \
+             ON DUPLICATE KEY UPDATE nonce = nonce",
+            params! { "nonce" => nonce, "expires_at" => expires_at },
+        )
+        .map_err(store_err)?;
+        Ok(conn.affected_rows() == 1)
     }
 }
 

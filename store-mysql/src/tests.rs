@@ -2,7 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_api::{McpCallRecord, ModelTokensDelta, TaskEventRow, TaskRow, TierTokensDelta};
+use busbar_api::{
+    McpCallRecord, McpDemotionRow, ModelTokensDelta, TaskEventRow, TaskRow, TierTokensDelta,
+};
 use std::collections::BTreeMap;
 
 fn test_url() -> Option<String> {
@@ -2574,4 +2576,394 @@ fn migrate_v4_to_v5_adds_the_task_store_without_wiping_data() {
         events_back, 1,
         "the migrated task_events table must read back"
     );
+}
+
+// ── THE DURABLE MCP DEMOTION RECORD AND THE SPENT-APPROVAL LEDGER ────────────────────────────
+//
+// Both are security state, and both arrived with the same hole: `busbar_api::Store` defaults
+// `put_mcp_demotion`/`list_mcp_demotions`/`clear_mcp_demotion` to accept-and-keep-nothing and
+// `redeem_ask_state` to `Ok(true)` — "yes, this call is the first redemption" — so a backend that
+// implements neither compiles, ships and reports every write successful while discarding it. What
+// that costs is a quarantined upstream that gets the operator's approval back at the next restart,
+// and a single-use human approval that a second node of the fleet redeems again.
+//
+// Every case below reads the state back through a RECONNECTED store, and the ledger cases include a
+// second, genuinely independent connection — which is what a second node of one deployment is.
+
+/// THE LIVE URL, OR A FAILURE. Deliberately NOT `test_url()`, whose `None` arm lets a case return
+/// green having tested nothing: an unimplemented ledger and a test that never ran produce the same
+/// green, and these are exactly the two properties where that costs an operator something. A test
+/// that can skip is a test that will skip on the day it matters.
+fn require_test_url() -> String {
+    std::env::var("BUSBAR_TEST_MYSQL_URL").unwrap_or_else(|_| {
+        panic!(
+            "BUSBAR_TEST_MYSQL_URL is unset. These cases are the ONLY coverage of the durable MCP \
+             demotion record and the spent-approval ledger on this backend, and both fail SILENTLY \
+             when unimplemented — the trait defaults answer Ok(()) to a demotion and `true` to \
+             every redemption. Skipping them reports green over a quarantined upstream that comes \
+             back approved and an approval that is redeemable once per node. Point this at a live \
+             MySQL, e.g. mysql://busbar:busbar@127.0.0.1:3307/busbar_test"
+        )
+    })
+}
+
+/// Per-process namespacing. This suite runs against a SHARED MySQL, so a fixed key would have two
+/// concurrent runs redeeming each other's approvals and reading each other's demotions.
+fn trust_ns(tag: &str) -> String {
+    format!("{}_{}", tag, std::process::id())
+}
+
+const TRUST_NOW: u64 = 2_000_000_000;
+
+fn demotion(server: &str, reason: &str, recorded_at: u64) -> McpDemotionRow {
+    McpDemotionRow {
+        server: server.to_string(),
+        reason: reason.to_string(),
+        recorded_at,
+    }
+}
+
+/// Drop exactly this suite's own rows, so a rerun (or a crashed prior run that left rows behind)
+/// starts where a first run does — and no other concurrently running test's rows are touched.
+fn reset_trust_state(store: &MysqlStore, servers: &[&str], nonces: &[&str]) {
+    let mut conn = store.conn().expect("conn");
+    for s in servers {
+        conn.exec_drop(
+            "DELETE FROM mcp_demotions WHERE server = :s",
+            params! { "s" => *s },
+        )
+        .expect("clear this test's own demotions");
+    }
+    for n in nonces {
+        conn.exec_drop(
+            "DELETE FROM spent_ask_states WHERE nonce = :n",
+            params! { "n" => *n },
+        )
+        .expect("clear this test's own ledger rows");
+    }
+}
+
+/// A DEMOTION OUTLIVES THE PROCESS THAT RECORDED IT. The engine derives a demotion from a live
+/// observation, and a process that has taken no observation has nothing to derive it from — it
+/// serves the upstream against the digest the operator approved. So without this row on the server,
+/// a restart hands a quarantined upstream its approval back.
+#[test]
+fn a_demotion_survives_dropping_the_store_and_reconnecting() {
+    let url = require_test_url();
+    let (a, b, c) = (
+        trust_ns("srv_payments"),
+        trust_ns("srv_search"),
+        trust_ns("srv_mail"),
+    );
+    {
+        let store = MysqlStore::connect(&url).expect("connect");
+        reset_trust_state(&store, &[&a, &b, &c], &[]);
+        store
+            .put_mcp_demotion(&demotion(&a, "tool-drift", TRUST_NOW))
+            .unwrap();
+        // UPSERT by `server`: a second demotion of one upstream REPLACES the row rather than
+        // standing a rival one beside it, so the boot read cannot hold two answers about one server.
+        store
+            .put_mcp_demotion(&demotion(&a, "digest-mismatch", TRUST_NOW + 10))
+            .unwrap();
+        store
+            .put_mcp_demotion(&demotion(&b, "tool-drift", TRUST_NOW + 20))
+            .unwrap();
+        store
+            .put_mcp_demotion(&demotion(&c, "tool-drift", TRUST_NOW + 30))
+            .unwrap();
+        store
+            .clear_mcp_demotion(&c)
+            .expect("a later observation that agrees with the approval clears the quarantine");
+        store
+            .clear_mcp_demotion(&trust_ns("srv_never_demoted"))
+            .expect("clearing a row that is not there is a no-op, not an error");
+        drop(store);
+    }
+
+    // A genuinely new store and pool — nothing carried over in this process.
+    let reopened = MysqlStore::connect(&url).expect("reconnect");
+    let mut mine = reopened
+        .list_mcp_demotions()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.server == a || r.server == b || r.server == c)
+        .collect::<Vec<_>>();
+    mine.sort_by(|x, y| x.server.cmp(&y.server));
+    let mut expect = vec![
+        demotion(&a, "digest-mismatch", TRUST_NOW + 10),
+        demotion(&b, "tool-drift", TRUST_NOW + 20),
+    ];
+    expect.sort_by(|x, y| x.server.cmp(&y.server));
+    assert_eq!(
+        mine, expect,
+        "the boot read must put every recorded quarantine back in force before the first request is \
+         served — upserted to the LATEST reason, and WITHOUT the one a later agreeing observation \
+         cleared. An empty or stale answer here is the accept-and-keep-nothing trait default, and \
+         it means a restart hands a demoted upstream the operator's approval back"
+    );
+    reset_trust_state(&reopened, &[&a, &b, &c], &[]);
+}
+
+/// SERVER IDS DIFFERING ONLY IN CASE ARE DISTINCT UPSTREAMS. This schema's default collation is
+/// utf8mb4_0900_ai_ci — CASE- AND ACCENT-INSENSITIVE — under which two distinct registrations
+/// COLLIDE ON THE PRIMARY KEY: quarantining one would silently overwrite the other's record, and
+/// clearing one would clear both. `COLLATE utf8mb4_bin` on the key column is what makes this pass;
+/// the same class of bug the v3 migration closed for `usage_metering.key_group_at_use`.
+#[test]
+fn servers_differing_only_in_case_are_distinct_demotions() {
+    let url = require_test_url();
+    let (lower, upper) = (trust_ns("srv_case"), trust_ns("srv_CASE"));
+    let store = MysqlStore::connect(&url).expect("connect");
+    reset_trust_state(&store, &[&lower, &upper], &[]);
+
+    store
+        .put_mcp_demotion(&demotion(&lower, "tool-drift", TRUST_NOW))
+        .unwrap();
+    store
+        .put_mcp_demotion(&demotion(&upper, "digest-mismatch", TRUST_NOW + 1))
+        .unwrap();
+    let mine = store
+        .list_mcp_demotions()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.server == lower || r.server == upper)
+        .count();
+    assert_eq!(
+        mine, 2,
+        "two upstreams whose ids differ only in case are two upstreams. Under this schema's default \
+         case-insensitive collation they collide on the primary key and one quarantine silently \
+         overwrites the other's"
+    );
+    // And clearing one must not clear the other.
+    store.clear_mcp_demotion(&lower).unwrap();
+    assert!(
+        store
+            .list_mcp_demotions()
+            .unwrap()
+            .iter()
+            .any(|r| r.server == upper),
+        "clearing one upstream's quarantine must not lift another's"
+    );
+    reset_trust_state(&store, &[&lower, &upper], &[]);
+}
+
+/// THE SPENT-APPROVAL LEDGER ACROSS A RESTART. The seal that carries a single-use approval is valid
+/// bytes on its second presentation exactly as on its first; only a record that the first happened
+/// tells them apart. In process memory that record dies with the process while the approval it
+/// records is still openable — so this drops the store and pool entirely and asks a new one.
+#[test]
+fn a_reconnected_store_refuses_a_second_redemption_of_the_same_approval() {
+    let url = require_test_url();
+    let (spent, fresh) = (trust_ns("nonce_restart"), trust_ns("nonce_restart_other"));
+    {
+        let store = MysqlStore::connect(&url).expect("connect");
+        reset_trust_state(&store, &[], &[&spent, &fresh]);
+        assert!(
+            store
+                .redeem_ask_state(&spent, TRUST_NOW + 900, TRUST_NOW)
+                .unwrap(),
+            "the FIRST redemption must be answered `true`, or nothing below is about single use"
+        );
+        drop(store);
+    }
+
+    let reopened = MysqlStore::connect(&url).expect("reconnect");
+    assert!(
+        !reopened
+            .redeem_ask_state(&spent, TRUST_NOW + 900, TRUST_NOW + 1)
+            .unwrap(),
+        "a restart handed a spent approval back. The approval has not lapsed — outliving a restart \
+         is the point of it — so the only thing that changed is that the process which recorded the \
+         redemption is gone. On a tool an operator gated because it moves money, that second \
+         redemption is the whole defect the gate exists to stop"
+    );
+    // THE CONTROL, and it is load-bearing: a ledger that refused everything would satisfy the case
+    // above and would have deleted the feature.
+    assert!(
+        reopened
+            .redeem_ask_state(&fresh, TRUST_NOW + 900, TRUST_NOW + 2)
+            .unwrap(),
+        "a different approval is not the one that was spent; refusing it would make the ledger a \
+         blanket refusal of every confirmation after the first"
+    );
+    reset_trust_state(&reopened, &[], &[&spent, &fresh]);
+}
+
+/// TWO CONNECTIONS ARE TWO NODES OF A FLEET, and this is the arrangement the durable ledger exists
+/// for. They share the deployment's signing key, so they share the SEAL — every check but this one
+/// passes on both — and the second redemption needs no timing skill at all: it is an ordinary
+/// sequential request that a load balancer sends somewhere else.
+#[test]
+fn a_second_node_cannot_redeem_an_approval_the_first_already_spent() {
+    let url = require_test_url();
+    let nonce = trust_ns("nonce_fleet");
+    let node_a = MysqlStore::connect(&url).expect("node A connects");
+    let node_b = MysqlStore::connect(&url).expect("node B connects");
+    reset_trust_state(&node_a, &[], &[&nonce]);
+
+    assert!(node_a
+        .redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
+        .unwrap());
+    assert!(
+        !node_b
+            .redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
+            .unwrap(),
+        "a second node of the same deployment redeemed an approval the first already spent, which \
+         is one operator confirmation executing once per node"
+    );
+    reset_trust_state(&node_a, &[], &[&nonce]);
+}
+
+/// NONCES DIFFERING ONLY IN CASE ARE DISTINCT APPROVALS, and this is the sharpest instance of the
+/// collation hazard in this schema. Under the default case-insensitive collation the ledger's
+/// primary key stops telling one approval from another: a genuinely fresh approval whose nonce
+/// happens to differ only in case from a spent one would be REFUSED — the gate breaking for an
+/// operator who did nothing wrong — while an attacker's near-miss variants fold onto one row.
+#[test]
+fn nonces_differing_only_in_case_are_distinct_approvals() {
+    let url = require_test_url();
+    let (lower, upper) = (trust_ns("nonce_case_ab"), trust_ns("nonce_case_AB"));
+    let store = MysqlStore::connect(&url).expect("connect");
+    reset_trust_state(&store, &[], &[&lower, &upper]);
+
+    assert!(store
+        .redeem_ask_state(&lower, TRUST_NOW + 900, TRUST_NOW)
+        .unwrap());
+    assert!(
+        store
+            .redeem_ask_state(&upper, TRUST_NOW + 900, TRUST_NOW)
+            .unwrap(),
+        "an approval whose nonce differs only in case from a spent one is a DIFFERENT approval and \
+         must redeem. Under the default case-insensitive collation it collides with the spent row \
+         and the gate refuses a confirmation the operator legitimately gave"
+    );
+    reset_trust_state(&store, &[], &[&lower, &upper]);
+}
+
+/// CONCURRENT REDEMPTION IS THE ATTACK, not the corner case. Eight independent CONNECTIONS — not
+/// eight threads sharing one — race on one approval through a barrier, which is the arrangement a
+/// read-then-write implementation answers "first" to eight times. Exactly one may win.
+#[test]
+fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
+    let url = require_test_url();
+    let nonce = trust_ns("nonce_race");
+    let cleanup = MysqlStore::connect(&url).expect("connect");
+    reset_trust_state(&cleanup, &[], &[&nonce]);
+    drop(cleanup);
+
+    let n = 8usize;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
+    let winners: usize = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let url = url.clone();
+                let nonce = nonce.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let node = MysqlStore::connect(&url).expect("a racing node connects");
+                    barrier.wait();
+                    node.redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
+                        .expect("redeem_ask_state") as usize
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+
+    assert_eq!(
+        winners, 1,
+        "exactly one redemption of one approval may be the first; {winners} nodes were each told \
+         they were, which is a test-and-set that is really a read followed by a write"
+    );
+    let cleanup = MysqlStore::connect(&url).expect("connect");
+    reset_trust_state(&cleanup, &[], &[&nonce]);
+}
+
+/// THE LEDGER IS BOUNDED BY ONE APPROVAL-VALIDITY WINDOW. `now` is handed to every redemption so the
+/// backend can drop what has lapsed in the same call — an entry recording an approval that can no
+/// longer be opened protects nothing, and a table that only grows is its own outage.
+#[test]
+fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
+    let url = require_test_url();
+    let (short, long, other) = (
+        trust_ns("nonce_short"),
+        trust_ns("nonce_long"),
+        trust_ns("nonce_sweeper"),
+    );
+    let store = MysqlStore::connect(&url).expect("connect");
+    reset_trust_state(&store, &[], &[&short, &long, &other]);
+
+    assert!(store
+        .redeem_ask_state(&short, TRUST_NOW + 10, TRUST_NOW)
+        .unwrap());
+    assert!(store
+        .redeem_ask_state(&long, TRUST_NOW + 10_000, TRUST_NOW)
+        .unwrap());
+
+    // A redemption past the first entry's expiry: the sweep rides along with it.
+    let later = TRUST_NOW + 11;
+    assert!(store.redeem_ask_state(&other, later + 900, later).unwrap());
+
+    let present = |nonce: &str| -> bool {
+        let mut conn = store.conn().expect("conn");
+        let n: Option<u64> = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM spent_ask_states WHERE nonce = :n",
+                params! { "n" => nonce },
+            )
+            .expect("count the ledger row");
+        n.unwrap_or(0) > 0
+    };
+    assert!(
+        !present(&short),
+        "the entry whose approval can no longer be opened must be evicted by the sweep the \
+         redemption carries; a ledger that only grows is its own outage"
+    );
+    assert!(
+        present(&long),
+        "an approval still inside its window must NOT be swept — evicting it early is exactly the \
+         double redemption this ledger exists to refuse"
+    );
+    reset_trust_state(&store, &[], &[&short, &long, &other]);
+}
+
+/// THE FULL u64 RANGE STORES FAITHFULLY. Both timestamp columns are BIGINT UNSIGNED, which is this
+/// backend's answer to the range problem the signed-BIGINT backends have to refuse — see `put_task`
+/// and `tasks.artifact_cursor` for the same choice. A clamped or wrapped `now` would be a security
+/// bug rather than a rounding one: clamped high it sweeps the ENTIRE ledger and then reports a
+/// replay as a first redemption.
+#[test]
+fn the_trust_state_stores_the_full_unsigned_range() {
+    let url = require_test_url();
+    let (server, nonce) = (trust_ns("srv_range"), trust_ns("nonce_range"));
+    let store = MysqlStore::connect(&url).expect("connect");
+    reset_trust_state(&store, &[&server], &[&nonce]);
+
+    store
+        .put_mcp_demotion(&demotion(&server, "tool-drift", u64::MAX))
+        .expect("BIGINT UNSIGNED holds the whole u64 range");
+    assert_eq!(
+        store
+            .list_mcp_demotions()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.server == server)
+            .expect("the row must be there")
+            .recorded_at,
+        u64::MAX,
+        "recorded_at must read back as itself, never wrapped or clamped"
+    );
+    assert!(
+        store.redeem_ask_state(&nonce, u64::MAX, TRUST_NOW).unwrap(),
+        "an expires_at at the top of the range is storable here and must redeem normally"
+    );
+    assert!(
+        !store
+            .redeem_ask_state(&nonce, u64::MAX, TRUST_NOW + 1)
+            .unwrap(),
+        "and the row it wrote must still be found on the replay — a value that did not read back as \
+         itself would answer `first redemption` twice"
+    );
+    reset_trust_state(&store, &[&server], &[&nonce]);
 }
