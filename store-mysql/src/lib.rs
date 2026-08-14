@@ -279,9 +279,8 @@ impl MysqlStore {
     /// private scratch table instead of racing every other concurrently-running test's legitimate
     /// writes to the real, shared `usage_windows`.
     ///
-    /// KNOWN, DOCUMENTED, NOT-YET-CLOSED GAP (found in `/codeaudit`, confirmed by two independent
-    /// adversarial design reviews — do not "fix" this with a lock; both reviews independently showed
-    /// a lock here is the wrong tool, see below): this UPDATE is UNSCOPED and assumes "a one-time
+    /// KNOWN, DOCUMENTED, NOT-YET-CLOSED GAP (a lock is the wrong tool here — see below for why
+    /// a `GET_LOCK`-based approach cannot close it): this UPDATE is UNSCOPED and assumes "a one-time
     /// boot migration runs before any concurrent traffic exists" — true for a full-fleet restart, but
     /// this store's own target topology is a ROLLING upgrade (README: multiple busbar nodes sharing
     /// one MySQL server). In a rolling upgrade, some nodes are ALREADY LIVE on v2 — genuinely writing
@@ -290,13 +289,13 @@ impl MysqlStore {
     /// predicate (`billable_requests = 0 AND requests > 0`) no longer matches it, and that row's
     /// PRE-v2 historical `requests` are PERMANENTLY never reclassified as billable — a silent,
     /// unrepairable billing undercount, i.e. exactly the `hydrate_budgets` bug class this migration
-    /// exists to close, reintroduced by a race in the migration itself. A `GET_LOCK`-based fix was
-    /// designed and rejected in review: it can only serialize NODES STILL BOOTING against each
+    /// exists to close, reintroduced by a race in the migration itself. A `GET_LOCK`-based fix
+    /// does not work: it can only serialize NODES STILL BOOTING against each
     /// other (the backfill's own re-run is already idempotent, so that case was never actually
     /// unsafe) — it does nothing for a node that is ALREADY LIVE and never touches this function at
     /// all, which is the actual race. Closing this for real needs pre-v2 rows to be identifiable by
     /// something live traffic cannot change (a captured `window_start`/time cutoff, or a per-row
-    /// provenance marker) — real redesign work, out of scope for this pass. OPERATIONAL MITIGATION
+    /// provenance marker) — a schema redesign this store does not yet have. OPERATIONAL MITIGATION
     /// until that redesign lands: either pause the whole fleet briefly for a v1->v2 upgrade
     /// specifically (not required for any OTHER version bump), or re-run this same predicate as a
     /// manual reconciliation query after a rolling upgrade completes — safe to do since the
