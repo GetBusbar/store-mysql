@@ -1,0 +1,82 @@
+name: debug mysql e2e SIGSEGV
+on:
+  workflow_dispatch: {}
+
+jobs:
+  chase-segfault:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
+        env:
+          MYSQL_ROOT_PASSWORD: busbar
+          MYSQL_USER: busbar
+          MYSQL_PASSWORD: busbar
+          MYSQL_DATABASE: busbar_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -ubusbar -pbusbar" --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - name: Checkout the plugin
+        uses: actions/checkout@v7
+        with:
+          path: plugin
+
+      - name: Checkout busbar (sibling path dependency) at the current dev-pin
+        uses: actions/checkout@v7
+        with:
+          repository: GetBusbar/busbar
+          ref: eac13fa3fecdd21ab3530751016a0c956e7e27b5
+          path: busbarAI
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: mysql — set strict sql_mode
+        run: mysql -h 127.0.0.1 -uroot -pbusbar -e "SET GLOBAL sql_mode='STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION';"
+
+      - name: enable core dumps and install gdb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb
+          ulimit -c unlimited
+          echo "$PWD/core.%e.%p" | sudo tee /proc/sys/kernel/core_pattern
+          cat /proc/sys/kernel/core_pattern
+
+      - name: build the e2e test binary
+        working-directory: plugin
+        run: cargo test -p busbar-store-mysql-plugin --test e2e --no-run
+        env:
+          BUSBAR_TEST_MYSQL_URL: mysql://busbar:busbar@127.0.0.1:3306/busbar_test
+
+      - name: run e2e repeatedly to catch the SIGSEGV, then backtrace the core
+        working-directory: plugin
+        env:
+          BUSBAR_TEST_MYSQL_URL: mysql://busbar:busbar@127.0.0.1:3306/busbar_test
+          RUST_BACKTRACE: full
+        run: |
+          set +e
+          ulimit -c unlimited
+          for i in $(seq 1 10); do
+            echo "=== attempt $i ==="
+            cargo test -p busbar-store-mysql-plugin --test e2e -- --nocapture
+            rc=$?
+            echo "exit code: $rc"
+            CORE=$(find . -maxdepth 2 -iname "core.*" 2>/dev/null | head -1)
+            if [ -n "$CORE" ]; then
+              echo "CORE FOUND: $CORE"
+              BIN=$(find target/debug/deps -maxdepth 1 -name "e2e-*" -type f -executable | head -1)
+              echo "BIN=$BIN"
+              gdb --batch \
+                -ex "bt full" \
+                -ex "info registers" \
+                -ex "thread apply all bt" \
+                -ex "info sharedlibrary" \
+                "$BIN" "$CORE" 2>&1
+              exit 0
+            fi
+            if [ "$rc" != "0" ]; then
+              echo "non-zero exit but no core file found yet, continuing loop"
+            fi
+          done
+          echo "no crash reproduced after 10 attempts"
