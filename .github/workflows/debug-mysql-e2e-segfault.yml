@@ -42,7 +42,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq gdb
           ulimit -c unlimited
-          echo "$PWD/core.%e.%p" | sudo tee /proc/sys/kernel/core_pattern
+          sudo mkdir -p /tmp/cores
+          sudo chmod 1777 /tmp/cores
+          echo "/tmp/cores/core.%e.%p.%t" | sudo tee /proc/sys/kernel/core_pattern
           cat /proc/sys/kernel/core_pattern
 
       - name: build the e2e test binary
@@ -61,25 +63,41 @@ jobs:
           ulimit -c unlimited
           BIN=$(find target/debug/deps -maxdepth 1 -name "e2e-*" -type f -executable | head -1)
           echo "BIN=$BIN"
-          find_core() { find . -maxdepth 2 -iname "core.*" 2>/dev/null | head -1; }
-          backtrace_and_exit() {
+          CRASHED=0
+          find_core() { find /tmp/cores -maxdepth 1 -iname "core.*" -newer /tmp/cores 2>/dev/null | head -1; find /tmp/cores -maxdepth 1 -iname "core.*" 2>/dev/null | sort | tail -1; }
+          backtrace_now() {
             CORE="$1"
             echo "CORE FOUND: $CORE"
+            ls -la /tmp/cores
             gdb --batch \
               -ex "bt full" \
               -ex "info registers" \
               -ex "thread apply all bt" \
               -ex "info sharedlibrary" \
               "$BIN" "$CORE" 2>&1
-            exit 0
+            CRASHED=1
           }
           # Phase 1: default `cargo test` parallelism, repeated (matches real CI shape exactly).
-          for i in $(seq 1 15); do
+          for i in $(seq 1 20); do
             echo "=== phase1 attempt $i (cargo test, default parallelism) ==="
             cargo test -p busbar-store-mysql-plugin --test e2e -- --nocapture
-            echo "exit code: $?"
-            CORE=$(find_core); [ -n "$CORE" ] && backtrace_and_exit "$CORE"
+            rc=$?
+            echo "exit code: $rc"
+            if [ "$rc" != "0" ]; then
+              CORE=$(find_core)
+              if [ -n "$CORE" ]; then
+                backtrace_now "$CORE"
+                break
+              else
+                echo "CRASHED (rc=$rc) BUT NO CORE FILE FOUND in /tmp/cores -- listing anyway:"
+                ls -la /tmp/cores 2>&1
+              fi
+            fi
           done
+          if [ "$CRASHED" = "1" ]; then
+            echo "CRASH_CAPTURED=true" >> "$GITHUB_ENV" 2>/dev/null || true
+            exit 0
+          fi
           # Phase 2: run the compiled binary directly, several copies AT ONCE, to stress concurrent
           # dlopen/dlclose of the same cdylib harder than the default single-process parallelism does.
           for i in $(seq 1 15); do
@@ -91,6 +109,22 @@ jobs:
             for j in 1 2 3 4; do
               echo "--- burst $i copy $j tail ---"; tail -15 "burst_${i}_${j}.log"
             done
-            CORE=$(find_core); [ -n "$CORE" ] && backtrace_and_exit "$CORE"
+            CORE=$(find_core)
+            if [ -n "$CORE" ]; then
+              backtrace_now "$CORE"
+              break
+            fi
           done
-          echo "no crash reproduced after 15+15 attempts"
+          echo "done. CRASHED=$CRASHED"
+          exit 0
+
+      - name: upload any core files as an artifact (safety net, always runs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cores-and-binary
+          path: |
+            /tmp/cores/
+            plugin/target/debug/deps/e2e-*
+          if-no-files-found: ignore
+          retention-days: 3
