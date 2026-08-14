@@ -51,7 +51,7 @@ jobs:
         env:
           BUSBAR_TEST_MYSQL_URL: mysql://busbar:busbar@127.0.0.1:3306/busbar_test
 
-      - name: run e2e repeatedly to catch the SIGSEGV, then backtrace the core
+      - name: run e2e repeatedly (parallel bursts) to catch the SIGSEGV, then backtrace the core
         working-directory: plugin
         env:
           BUSBAR_TEST_MYSQL_URL: mysql://busbar:busbar@127.0.0.1:3306/busbar_test
@@ -59,26 +59,38 @@ jobs:
         run: |
           set +e
           ulimit -c unlimited
-          for i in $(seq 1 10); do
-            echo "=== attempt $i ==="
+          BIN=$(find target/debug/deps -maxdepth 1 -name "e2e-*" -type f -executable | head -1)
+          echo "BIN=$BIN"
+          find_core() { find . -maxdepth 2 -iname "core.*" 2>/dev/null | head -1; }
+          backtrace_and_exit() {
+            CORE="$1"
+            echo "CORE FOUND: $CORE"
+            gdb --batch \
+              -ex "bt full" \
+              -ex "info registers" \
+              -ex "thread apply all bt" \
+              -ex "info sharedlibrary" \
+              "$BIN" "$CORE" 2>&1
+            exit 0
+          }
+          # Phase 1: default `cargo test` parallelism, repeated (matches real CI shape exactly).
+          for i in $(seq 1 15); do
+            echo "=== phase1 attempt $i (cargo test, default parallelism) ==="
             cargo test -p busbar-store-mysql-plugin --test e2e -- --nocapture
-            rc=$?
-            echo "exit code: $rc"
-            CORE=$(find . -maxdepth 2 -iname "core.*" 2>/dev/null | head -1)
-            if [ -n "$CORE" ]; then
-              echo "CORE FOUND: $CORE"
-              BIN=$(find target/debug/deps -maxdepth 1 -name "e2e-*" -type f -executable | head -1)
-              echo "BIN=$BIN"
-              gdb --batch \
-                -ex "bt full" \
-                -ex "info registers" \
-                -ex "thread apply all bt" \
-                -ex "info sharedlibrary" \
-                "$BIN" "$CORE" 2>&1
-              exit 0
-            fi
-            if [ "$rc" != "0" ]; then
-              echo "non-zero exit but no core file found yet, continuing loop"
-            fi
+            echo "exit code: $?"
+            CORE=$(find_core); [ -n "$CORE" ] && backtrace_and_exit "$CORE"
           done
-          echo "no crash reproduced after 10 attempts"
+          # Phase 2: run the compiled binary directly, several copies AT ONCE, to stress concurrent
+          # dlopen/dlclose of the same cdylib harder than the default single-process parallelism does.
+          for i in $(seq 1 15); do
+            echo "=== phase2 burst $i (4x concurrent binary invocations) ==="
+            for j in 1 2 3 4; do
+              "$BIN" --nocapture > "burst_${i}_${j}.log" 2>&1 &
+            done
+            wait
+            for j in 1 2 3 4; do
+              echo "--- burst $i copy $j tail ---"; tail -15 "burst_${i}_${j}.log"
+            done
+            CORE=$(find_core); [ -n "$CORE" ] && backtrace_and_exit "$CORE"
+          done
+          echo "no crash reproduced after 15+15 attempts"
