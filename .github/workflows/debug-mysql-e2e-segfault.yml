@@ -1,6 +1,8 @@
 name: debug mysql e2e SIGSEGV
 on:
   workflow_dispatch: {}
+  push:
+    branches: [debug/mysql-e2e-segfault]
 
 jobs:
   chase-segfault:
