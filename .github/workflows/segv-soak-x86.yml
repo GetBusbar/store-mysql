@@ -25,9 +25,12 @@ jobs:
           # UNFIXED: the exact pin the wild crashes were seen on.
           - leg: control
             busbar_ref: eac13fa3fecdd21ab3530751016a0c956e7e27b5
-          # FIXED: the RTLD_NODELETE commit on fix/1.6.0-mysql-e2e-segv.
+          # FIXED: the thread-lifetime commit on fix/1.6.0-plugin-thread-lifetime. Plugin code runs
+          # only on loader-owned workers that never retire, so no thread carrying plugin TLS ever
+          # exits. (The withdrawn RTLD_NODELETE leg is deliberately gone — it returned the wrong
+          # plugin's image and must never be a comparison point again.)
           - leg: fixed
-            busbar_ref: c015ca466c4dc5e34153c2f5ab309f95866cdf7e
+            busbar_ref: 225e9e176ac17d6f147174aa40d82bc2172440a6
     name: ${{ matrix.leg }}
     services:
       mysql:
@@ -59,7 +62,8 @@ jobs:
           echo "leg=${{ matrix.leg }} busbar_ref=${{ matrix.busbar_ref }}"
           # The one line that distinguishes the two legs, printed so a green run cannot be
           # mistaken for a leg that silently checked out the wrong tree.
-          grep -c RTLD_NODELETE busbarAI/crates/plugin-loader/src/lib.rs || echo "0 (unfixed loader)"
+          echo -n "ffi_thread references in the loader: "
+          grep -c ffi_thread busbarAI/crates/plugin-loader/src/lib.rs || echo "0 (unfixed loader)"
 
       - uses: dtolnay/rust-toolchain@stable
 
