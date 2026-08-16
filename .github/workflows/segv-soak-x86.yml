@@ -25,12 +25,11 @@ jobs:
           # UNFIXED: the exact pin the wild crashes were seen on.
           - leg: control
             busbar_ref: eac13fa3fecdd21ab3530751016a0c956e7e27b5
-          # FIXED: the thread-lifetime commit on fix/1.6.0-plugin-thread-lifetime. Plugin code runs
-          # only on loader-owned workers that never retire, so no thread carrying plugin TLS ever
-          # exits. (The withdrawn RTLD_NODELETE leg is deliberately gone — it returned the wrong
-          # plugin's image and must never be a comparison point again.)
+          # FIXED: the NARROW thread-lifetime commit — per-load crossings confined to workers that
+          # never retire, `busbar_call`/`busbar_free` left inline so the request path stays at
+          # baseline latency. This leg is what proves the narrowing did not give the crash back.
           - leg: fixed
-            busbar_ref: 225e9e176ac17d6f147174aa40d82bc2172440a6
+            busbar_ref: 6f462e4ca2c97a3546720f038d789f77eaa75f0b
     name: ${{ matrix.leg }}
     services:
       mysql:
